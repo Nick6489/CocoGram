@@ -15,38 +15,86 @@ struct TDLibConfiguration {
     let filesDirectory: String
     let useTestDataCenter: Bool
 
-    static func fromLocalConfiguration() -> TDLibConfiguration? {
-        let environment = ProcessInfo.processInfo.environment.merging(Self.localConfiguration()) { environmentValue, _ in
-            environmentValue
-        }
+    /// Resolves credentials from, in order of precedence (highest first): environment
+    /// variables, `.cocogram.local` in the working directory (developer workflows), then
+    /// credentials saved in Application Support by the in-app setup screen (end users).
+    /// Returns nil when no API credentials are available from any source.
+    static func resolve() -> TDLibConfiguration? {
+        var values = savedConfiguration()
+        values.merge(localConfiguration()) { _, new in new }
+        values.merge(ProcessInfo.processInfo.environment) { _, new in new }
 
         guard
-            let apiIDString = environment["COCOGRAM_API_ID"],
+            let apiIDString = values["COCOGRAM_API_ID"],
             let apiID = Int(apiIDString),
-            let apiHash = environment["COCOGRAM_API_HASH"],
+            let apiHash = values["COCOGRAM_API_HASH"],
             !apiHash.isEmpty
         else {
             return nil
         }
 
-        let baseDirectory = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first?
-            .appendingPathComponent("CocoGram", isDirectory: true)
-            .path ?? NSTemporaryDirectory().appending("CocoGram")
-
+        let baseDirectory = appSupportDirectory().path
         return TDLibConfiguration(
             apiID: apiID,
             apiHash: apiHash,
-            databaseDirectory: environment["COCOGRAM_TDLIB_DATABASE"] ?? "\(baseDirectory)/tdlib/database",
-            filesDirectory: environment["COCOGRAM_TDLIB_FILES"] ?? "\(baseDirectory)/tdlib/files",
-            useTestDataCenter: environment["COCOGRAM_TDLIB_TEST_DC"] == "1"
+            databaseDirectory: values["COCOGRAM_TDLIB_DATABASE"] ?? "\(baseDirectory)/tdlib/database",
+            filesDirectory: values["COCOGRAM_TDLIB_FILES"] ?? "\(baseDirectory)/tdlib/files",
+            useTestDataCenter: values["COCOGRAM_TDLIB_TEST_DC"] == "1"
         )
+    }
+
+    /// True when usable credentials already exist anywhere — used to decide whether the
+    /// first-run setup screen needs to be shown.
+    static var hasUsableCredentials: Bool {
+        resolve() != nil
+    }
+
+    /// The app's per-user data directory: ~/Library/Application Support/CocoGram.
+    static func appSupportDirectory() -> URL {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return base.appendingPathComponent("CocoGram", isDirectory: true)
+    }
+
+    private static var savedCredentialsURL: URL {
+        appSupportDirectory().appendingPathComponent("credentials.conf")
+    }
+
+    /// Persists credentials entered through the in-app setup screen so the next launch
+    /// finds them automatically. Written with 0600 permissions since the file holds the
+    /// app's API hash; the user's actual Telegram login lives in TDLib's encrypted database.
+    static func saveCredentials(apiID: Int, apiHash: String, useTestDataCenter: Bool) throws {
+        let directory = appSupportDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var lines = [
+            "# Written by CocoGram. Holds your my.telegram.org API credentials.",
+            "COCOGRAM_API_ID=\(apiID)",
+            "COCOGRAM_API_HASH=\(apiHash)"
+        ]
+        if useTestDataCenter {
+            lines.append("COCOGRAM_TDLIB_TEST_DC=1")
+        }
+
+        let url = savedCredentialsURL
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    private static func savedConfiguration() -> [String: String] {
+        parseKeyValueFile(at: savedCredentialsURL)
     }
 
     private static func localConfiguration() -> [String: String] {
         let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(".cocogram.local")
+        return parseKeyValueFile(at: url)
+    }
+
+    /// Parses a `KEY=VALUE` file (blank lines and `#` comments ignored). Shared by the
+    /// `.cocogram.local` developer file and the saved-credentials file.
+    private static func parseKeyValueFile(at url: URL) -> [String: String] {
         guard let contents = try? String(contentsOf: url, encoding: .utf8) else {
             return [:]
         }

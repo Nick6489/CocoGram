@@ -3,28 +3,21 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowController: MainWindowController?
-    private let telegramClient: TelegramClient = {
-        if let configuration = TDLibConfiguration.fromLocalConfiguration() {
-            return TDLibTelegramClient(configuration: configuration)
-        }
-
-        return DummyTelegramClient()
-    }()
+    private var telegramClient: TelegramClient!
+    private var setupWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        NSApp.mainMenu = Self.makeMainMenu()
-        let controller = MainWindowController(telegramClient: telegramClient)
-        controller.showWindow(nil)
-        controller.window?.makeKeyAndOrderFront(nil)
-        windowController = controller
+        NSApp.mainMenu = makeMainMenu()
         NSApp.activate(ignoringOtherApps: true)
 
-        Task {
-            try? await telegramClient.start()
-        }
-        Task {
-            await observeTelegramUpdates()
+        // Choose the client only after we know whether credentials exist. With none, an
+        // accessible first-run setup screen lets the user enter API credentials (or opt
+        // into sample data) by ear — see AccountSetupController.
+        if let configuration = TDLibConfiguration.resolve() {
+            startSession(with: TDLibTelegramClient(configuration: configuration))
+        } else {
+            presentAccountSetup()
         }
     }
 
@@ -32,11 +25,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    /// Builds the main window for the chosen client and starts the Telegram event loop.
+    private func startSession(with client: TelegramClient) {
+        telegramClient = client
+        let controller = MainWindowController(telegramClient: client)
+        controller.showWindow(nil)
+        controller.window?.makeKeyAndOrderFront(nil)
+        windowController = controller
+
+        Task {
+            try? await client.start()
+        }
+        Task {
+            await observeTelegramUpdates()
+        }
+    }
+
+    /// Presents the first-run / revisit credential setup screen in its own window. The
+    /// "use sample data" escape hatch is offered only on first run (before a session
+    /// exists); revisiting from the menu just saves and asks the user to relaunch.
+    @objc func showAccountSetup() {
+        presentAccountSetup()
+    }
+
+    private func presentAccountSetup() {
+        if let existing = setupWindow {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let isRevisit = telegramClient != nil
+        let controller = AccountSetupController(showsSampleDataOption: !isRevisit)
+        controller.onComplete = { [weak self] outcome in
+            guard let self else { return }
+            switch outcome {
+            case .credentials(let apiID, let apiHash, let useTestDataCenter):
+                do {
+                    try TDLibConfiguration.saveCredentials(
+                        apiID: apiID,
+                        apiHash: apiHash,
+                        useTestDataCenter: useTestDataCenter
+                    )
+                } catch {
+                    controller.showError("Couldn't save your credentials: \(error.localizedDescription)")
+                    return
+                }
+
+                if isRevisit {
+                    // A live session is already running against the old client; swapping it
+                    // mid-flight is fragile, so confirm the save and ask for a relaunch.
+                    self.dismissSetup()
+                    self.announce("Credentials saved. Quit and reopen CocoGram to sign in with this account.")
+                } else if let configuration = TDLibConfiguration.resolve() {
+                    self.dismissSetup()
+                    self.startSession(with: TDLibTelegramClient(configuration: configuration))
+                } else {
+                    controller.showError("Saved, but those credentials couldn't be read back. Check the values and try again.")
+                }
+            case .useSampleData:
+                self.dismissSetup()
+                self.startSession(with: DummyTelegramClient())
+            }
+        }
+
+        let window = NSWindow(contentViewController: controller)
+        window.title = "Set Up CocoGram"
+        window.styleMask = [.titled, .closable]
+        window.setContentSize(NSSize(width: 480, height: 380))
+        window.isReleasedWhenClosed = false
+        window.center()
+        setupWindow = window
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    private func dismissSetup() {
+        setupWindow?.close()
+        setupWindow = nil
+    }
+
+    /// Posts a high-priority VoiceOver announcement (mirrors the app's existing pattern
+    /// for surfacing important state changes to assistive technology).
+    private func announce(_ message: String) {
+        let element: Any = windowController?.window ?? NSApp as Any
+        NSAccessibility.post(
+            element: element,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue
+            ]
+        )
+    }
+
     /// Builds the application menu bar programmatically. SwiftPM executables have no
     /// MainMenu.xib, so without this there is no app menu and standard shortcuts
     /// (Cmd+Q, Cmd+W, Cmd+C/V/X) never fire — AppKit resolves key equivalents through
     /// NSApp.mainMenu before the responder chain. The first item is treated as the app menu.
-    private static func makeMainMenu() -> NSMenu {
+    private func makeMainMenu() -> NSMenu {
         let appName = ProcessInfo.processInfo.processName
         let mainMenu = NSMenu()
 
@@ -46,6 +131,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
         appMenu.addItem(withTitle: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        let setup = appMenu.addItem(withTitle: "Set Up Telegram Account…", action: #selector(showAccountSetup), keyEquivalent: "")
+        setup.target = self
+        setup.setAccessibilityHelp("Enter or change your Telegram API credentials.")
         appMenu.addItem(.separator())
         let hide = appMenu.addItem(withTitle: "Hide \(appName)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         hide.target = NSApp
@@ -1056,6 +1145,163 @@ final class AuthenticationPromptController: NSViewController {
         }
         errorLabel.isHidden = true
         onSubmit?(value)
+    }
+}
+
+/// First-run / revisit screen for entering Telegram API credentials. Built entirely in
+/// code with the same accessibility contract as the rest of the app: every control has an
+/// explicit label/help, the field order reads top-to-bottom under VoiceOver, validation
+/// errors are announced at high priority, and focus lands on the first field on appear.
+final class AccountSetupController: NSViewController {
+    enum Outcome {
+        case credentials(apiID: Int, apiHash: String, useTestDataCenter: Bool)
+        case useSampleData
+    }
+
+    var onComplete: ((Outcome) -> Void)?
+
+    private let showsSampleDataOption: Bool
+    private let apiIDField = NSTextField()
+    private let apiHashField = NSTextField()
+    private let testDCCheckbox = NSButton(checkboxWithTitle: "Use Telegram test servers", target: nil, action: nil)
+    private let errorLabel = NSTextField(labelWithString: "")
+    private let continueButton = NSButton(title: "Continue", target: nil, action: nil)
+    private let sampleDataButton = NSButton(title: "Use Sample Data Instead", target: nil, action: nil)
+
+    init(showsSampleDataOption: Bool) {
+        self.showsSampleDataOption = showsSampleDataOption
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func loadView() {
+        view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+
+        let titleLabel = NSTextField(labelWithString: "Set Up CocoGram")
+        titleLabel.font = .systemFont(ofSize: 22, weight: .semibold)
+        titleLabel.setAccessibilityRole(.staticText)
+        titleLabel.setAccessibilityLabel("Set Up CocoGram")
+
+        let messageLabel = NSTextField(wrappingLabelWithString: "Enter the API credentials from my.telegram.org to connect your Telegram account.")
+        messageLabel.font = .systemFont(ofSize: 13)
+        messageLabel.textColor = .secondaryLabelColor
+        messageLabel.setAccessibilityLabel("Enter the API credentials from my dot telegram dot org to connect your Telegram account.")
+
+        let idCaption = NSTextField(labelWithString: "API ID")
+        idCaption.font = .systemFont(ofSize: 12, weight: .semibold)
+        idCaption.textColor = .secondaryLabelColor
+        idCaption.setAccessibilityElement(false)
+        apiIDField.placeholderString = "API ID (numbers)"
+        apiIDField.setAccessibilityLabel("API ID")
+        apiIDField.setAccessibilityHelp("The numeric api_id from my.telegram.org.")
+
+        let hashCaption = NSTextField(labelWithString: "API Hash")
+        hashCaption.font = .systemFont(ofSize: 12, weight: .semibold)
+        hashCaption.textColor = .secondaryLabelColor
+        hashCaption.setAccessibilityElement(false)
+        apiHashField.placeholderString = "API Hash"
+        apiHashField.setAccessibilityLabel("API Hash")
+        apiHashField.setAccessibilityHelp("The api_hash string from my.telegram.org.")
+
+        testDCCheckbox.setAccessibilityLabel("Use Telegram test servers")
+        testDCCheckbox.setAccessibilityHelp("Connect to Telegram's isolated test data center instead of your real account. Leave off for normal use.")
+
+        errorLabel.textColor = .systemRed
+        errorLabel.font = .systemFont(ofSize: 12)
+        errorLabel.isHidden = true
+        errorLabel.setAccessibilityRole(.staticText)
+
+        continueButton.bezelStyle = .rounded
+        continueButton.keyEquivalent = "\r"
+        continueButton.target = self
+        continueButton.action = #selector(submit)
+        continueButton.setAccessibilityLabel("Continue")
+        continueButton.setAccessibilityHelp("Save these credentials and connect to Telegram.")
+
+        let buttonRow = NSStackView(views: [continueButton])
+        buttonRow.orientation = .horizontal
+        buttonRow.spacing = 12
+
+        if showsSampleDataOption {
+            sampleDataButton.bezelStyle = .rounded
+            sampleDataButton.target = self
+            sampleDataButton.action = #selector(useSampleData)
+            sampleDataButton.setAccessibilityLabel("Use sample data instead")
+            sampleDataButton.setAccessibilityHelp("Skip setup and explore CocoGram with built-in sample conversations. You can add your account later from the application menu.")
+            buttonRow.insertArrangedSubview(sampleDataButton, at: 0)
+        }
+
+        let stack = NSStackView(views: [
+            titleLabel, messageLabel,
+            idCaption, apiIDField,
+            hashCaption, apiHashField,
+            testDCCheckbox, errorLabel, buttonRow
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 26, bottom: 22, right: 26)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setCustomSpacing(18, after: messageLabel)
+        view.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: view.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            titleLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            messageLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            apiIDField.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            apiHashField.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            errorLabel.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        view.window?.makeFirstResponder(apiIDField)
+    }
+
+    func showError(_ message: String) {
+        errorLabel.stringValue = message
+        errorLabel.setAccessibilityLabel(message)
+        errorLabel.isHidden = false
+        NSAccessibility.post(
+            element: errorLabel,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue
+            ]
+        )
+    }
+
+    @objc private func submit() {
+        let idText = apiIDField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hash = apiHashField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !idText.isEmpty, !hash.isEmpty else {
+            showError("Both API ID and API Hash are required.")
+            return
+        }
+        guard let apiID = Int(idText) else {
+            showError("API ID must be a number, like 36271916.")
+            return
+        }
+
+        errorLabel.isHidden = true
+        onComplete?(.credentials(apiID: apiID, apiHash: hash, useTestDataCenter: testDCCheckbox.state == .on))
+    }
+
+    @objc private func useSampleData() {
+        onComplete?(.useSampleData)
     }
 }
 
