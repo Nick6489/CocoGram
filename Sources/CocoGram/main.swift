@@ -608,6 +608,17 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         headerSubtitle.font = .systemFont(ofSize: 13)
         headerSubtitle.textColor = .secondaryLabelColor
 
+        // A long title/subtitle must never dictate the window's minimum width. These
+        // single-line header labels truncate instead of expanding, and yield horizontally
+        // (low compression resistance) so the window resizes freely down to its minSize.
+        // VoiceOver still reads the full text via the accessibility labels set in show(item:).
+        for label in [headerTitle, headerSubtitle] {
+            label.lineBreakMode = .byTruncatingTail
+            label.cell?.truncatesLastVisibleLine = true
+            label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        }
+
         actionStack.orientation = .horizontal
         actionStack.spacing = 8
         actionStack.alignment = .centerY
@@ -954,6 +965,8 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
             return 92
         case .voice:
             return 124
+        case .media:
+            return 92
         }
     }
 }
@@ -1498,6 +1511,9 @@ final class MessageTableCellView: NSTableCellView {
     private let statusLabel = NSTextField(labelWithString: "")
     private let voiceContainer = NSStackView()
     private let voiceTranscriptLabel = NSTextField(wrappingLabelWithString: "")
+    private let mediaContainer = NSStackView()
+    private let mediaIcon = NSImageView()
+    private let mediaLabel = NSTextField(labelWithString: "")
     private var accessibilitySummary = ""
 
     override init(frame frameRect: NSRect) {
@@ -1523,10 +1539,18 @@ final class MessageTableCellView: NSTableCellView {
             bodyLabel.stringValue = body
             bodyLabel.isHidden = false
             voiceContainer.isHidden = true
+            mediaContainer.isHidden = true
         case .voice(let duration, let transcript):
             bodyLabel.isHidden = true
             voiceContainer.isHidden = false
+            mediaContainer.isHidden = true
             voiceTranscriptLabel.stringValue = "Voice message, \(Message.format(duration)). \(transcript)"
+        case .media(let icon, let label):
+            bodyLabel.isHidden = true
+            voiceContainer.isHidden = true
+            mediaContainer.isHidden = false
+            mediaIcon.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
+            mediaLabel.stringValue = label
         }
     }
 
@@ -1544,6 +1568,13 @@ final class MessageTableCellView: NSTableCellView {
         bodyLabel.font = .systemFont(ofSize: 14)
         bodyLabel.maximumNumberOfLines = 0
         bodyLabel.setAccessibilityElement(false)
+        // Wrap (don't expand) so a long message can never drive the cell/column/window
+        // width. Low horizontal compression resistance lets the column shrink below the
+        // text's natural single-line width; preferredMaxLayoutWidth gives wrapping a target.
+        bodyLabel.lineBreakMode = .byWordWrapping
+        bodyLabel.preferredMaxLayoutWidth = 360
+        bodyLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        bodyLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         timeLabel.font = .systemFont(ofSize: 11)
         timeLabel.textColor = .tertiaryLabelColor
@@ -1576,7 +1607,23 @@ final class MessageTableCellView: NSTableCellView {
         voiceContainer.addArrangedSubview(voiceTranscriptLabel)
         voiceContainer.setAccessibilityElement(false)
 
-        let stack = NSStackView(views: [senderLabel, bodyLabel, voiceContainer, metadataStack])
+        mediaIcon.symbolConfiguration = .init(pointSize: 20, weight: .regular)
+        mediaIcon.contentTintColor = .controlAccentColor
+        mediaIcon.setAccessibilityElement(false)
+
+        mediaLabel.font = .systemFont(ofSize: 14)
+        mediaLabel.lineBreakMode = .byTruncatingTail
+        mediaLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        mediaLabel.setAccessibilityElement(false)
+
+        mediaContainer.orientation = .horizontal
+        mediaContainer.alignment = .centerY
+        mediaContainer.spacing = 8
+        mediaContainer.addArrangedSubview(mediaIcon)
+        mediaContainer.addArrangedSubview(mediaLabel)
+        mediaContainer.setAccessibilityElement(false)
+
+        let stack = NSStackView(views: [senderLabel, bodyLabel, voiceContainer, mediaContainer, metadataStack])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 5
@@ -1635,6 +1682,18 @@ final class MessageBubbleView: NSView {
         case .voice(let duration, let transcript):
             bodyView = VoiceMessageView(duration: duration, transcript: transcript)
             bodyView.setAccessibilityElement(false)
+        case .media(let icon, let label):
+            let iconView = NSImageView(image: NSImage(systemSymbolName: icon, accessibilityDescription: nil) ?? NSImage())
+            iconView.contentTintColor = .controlAccentColor
+            let text = NSTextField(labelWithString: label)
+            text.font = .systemFont(ofSize: 14)
+            text.lineBreakMode = .byTruncatingTail
+            let row = NSStackView(views: [iconView, text])
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 6
+            row.setAccessibilityElement(false)
+            bodyView = row
         }
 
         let time = NSTextField(labelWithString: message.time)

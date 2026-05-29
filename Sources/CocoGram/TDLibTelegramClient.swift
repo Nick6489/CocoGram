@@ -441,10 +441,11 @@ final class TDLibTelegramClient: TelegramClient {
         case .messageText(let text):
             return .text(text.text.text)
         case .messageVoiceNote(let voiceNote):
-            let transcript = voiceNote.voiceNote.speechRecognitionResult.map(String.init(describing:)) ?? voiceNote.caption.text
-            return .voice(duration: TimeInterval(voiceNote.voiceNote.duration), transcript: transcript.isEmpty ? "No transcript available." : transcript)
+            let transcript = voiceTranscript(voiceNote)
+            return .voice(duration: TimeInterval(voiceNote.voiceNote.duration), transcript: transcript)
         default:
-            return .text("[\(String(describing: content))]")
+            let summary = mediaSummary(content)
+            return .media(icon: summary.icon, label: summary.label)
         }
     }
 
@@ -456,7 +457,52 @@ final class TDLibTelegramClient: TelegramClient {
         case .messageVoiceNote(let voiceNote):
             return "Voice message, \(Message.format(TimeInterval(voiceNote.voiceNote.duration)))"
         default:
-            return String(describing: message.content)
+            return mediaSummary(message.content).label
+        }
+    }
+
+    /// Extracts a recognized voice transcript only from a finalized recognition result;
+    /// pending/error results fall back to the caption (avoids dumping the enum value).
+    private func voiceTranscript(_ voiceNote: MessageVoiceNote) -> String {
+        let recognized: String
+        switch voiceNote.voiceNote.speechRecognitionResult {
+        case .speechRecognitionResultText(let result):
+            recognized = result.text
+        default:
+            recognized = voiceNote.caption.text
+        }
+        return recognized.isEmpty ? "No transcript available." : recognized
+    }
+
+    /// Maps any non-text/non-voice content to a clean SF Symbol + human label (with caption
+    /// appended where the content type carries one). Never produces a reflection dump — the
+    /// `default` arm returns a generic "Message" for service/poll/location/etc.
+    private func mediaSummary(_ content: MessageContent) -> (icon: String, label: String) {
+        func withCaption(_ base: String, _ caption: FormattedText) -> String {
+            caption.text.isEmpty ? base : "\(base) — \(caption.text)"
+        }
+
+        switch content {
+        case .messagePhoto(let photo):
+            return ("photo", withCaption("Photo", photo.caption))
+        case .messageVideo(let video):
+            let base = "Video, \(Message.format(TimeInterval(video.video.duration)))"
+            return ("video", withCaption(base, video.caption))
+        case .messageAnimation(let animation):
+            return ("photo", withCaption("GIF", animation.caption))
+        case .messageSticker(let sticker):
+            let emoji = sticker.sticker.emoji
+            return ("face.smiling", emoji.isEmpty ? "Sticker" : "Sticker \(emoji)")
+        case .messageDocument(let document):
+            let name = document.document.fileName
+            return ("doc", name.isEmpty ? "Document" : "Document \(name)")
+        case .messageAudio(let audio):
+            let track = audio.audio
+            let title = track.title.isEmpty ? track.fileName : track.title
+            let base = track.performer.isEmpty ? "Audio \(title)" : "Audio \(track.performer) — \(title)"
+            return ("music.note", withCaption(base, audio.caption))
+        default:
+            return ("doc.text", "Message")
         }
     }
 
