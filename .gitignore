@@ -3,3 +3,8 @@
 DerivedData/
 *.xcuserdata/
 .cocogram.local
+
+# Packaging output and signing secrets — never commit these.
+dist/
+*.p8
+*.icns
