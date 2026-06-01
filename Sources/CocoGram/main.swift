@@ -1783,6 +1783,7 @@ final class MessageTableCellView: NSTableCellView {
     private let mediaIcon = NSImageView()
     private let mediaLabel = NSTextField(labelWithString: "")
     private var accessibilitySummary = ""
+    private var isVoiceMessage = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1805,16 +1806,22 @@ final class MessageTableCellView: NSTableCellView {
 
         switch message.kind {
         case .text(let body):
+            isVoiceMessage = false
+            setAccessibilityHelp("Message")
             bodyLabel.stringValue = body
             bodyLabel.isHidden = false
             voiceContainer.isHidden = true
             mediaContainer.isHidden = true
         case .voice(let duration, let transcript, _):
+            isVoiceMessage = true
+            setAccessibilityHelp("Voice message. Press VoiceOver Space to play, pause, or resume.")
             bodyLabel.isHidden = true
             voiceContainer.isHidden = false
             mediaContainer.isHidden = true
             voiceTranscriptLabel.stringValue = "Voice message, \(Message.format(duration)). \(transcript)"
         case .media(let icon, let label):
+            isVoiceMessage = false
+            setAccessibilityHelp("Message")
             bodyLabel.isHidden = true
             voiceContainer.isHidden = true
             mediaContainer.isHidden = false
@@ -1912,6 +1919,12 @@ final class MessageTableCellView: NSTableCellView {
 
     override func accessibilityLabel() -> String? {
         accessibilitySummary
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        guard isVoiceMessage else { return false }
+        onPlayVoiceMessage?()
+        return true
     }
 
     @objc private func playVoiceMessage() {
