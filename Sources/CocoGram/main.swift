@@ -686,6 +686,7 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     private var audioPlayer: AVAudioPlayer?
     private var playingVoiceFileID: Int?
     private var playbackTask: Task<Void, Never>?
+    private var decodedVoiceMessageURL: URL?
 
     init(telegramClient: TelegramClient) {
         self.telegramClient = telegramClient
@@ -975,6 +976,8 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
 
         playbackTask?.cancel()
         audioPlayer?.stop()
+        audioPlayer = nil
+        removeDecodedVoiceMessage()
         playingVoiceFileID = fileID
         updatePlaybackStatus("Downloading voice message")
 
@@ -983,7 +986,16 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
             do {
                 let url = try await telegramClient.downloadVoiceMessage(fileID: fileID)
                 guard !Task.isCancelled, playingVoiceFileID == fileID else { return }
-                let player = try AVAudioPlayer(contentsOf: url)
+                let decodedURL = try await Task.detached {
+                    try OggOpusDecoder.decodeToTemporaryPCMFile(url)
+                }.value
+                guard !Task.isCancelled, playingVoiceFileID == fileID else {
+                    try? FileManager.default.removeItem(at: decodedURL)
+                    return
+                }
+                removeDecodedVoiceMessage()
+                decodedVoiceMessageURL = decodedURL
+                let player = try AVAudioPlayer(contentsOf: decodedURL)
                 player.delegate = self
                 player.enableRate = true
                 player.rate = selectedPlaybackRate
@@ -994,6 +1006,7 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
                 updatePlaybackStatus("Playing voice message")
             } catch {
                 guard !Task.isCancelled, playingVoiceFileID == fileID else { return }
+                removeDecodedVoiceMessage()
                 playingVoiceFileID = nil
                 updatePlaybackStatus("Voice playback failed")
                 announce("Couldn't play that voice message: \(error.localizedDescription)")
@@ -1055,7 +1068,14 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         audioPlayer?.stop()
         audioPlayer = nil
         playingVoiceFileID = nil
+        removeDecodedVoiceMessage()
         updatePlaybackStatus("Voice playback: idle")
+    }
+
+    private func removeDecodedVoiceMessage() {
+        guard let decodedVoiceMessageURL else { return }
+        try? FileManager.default.removeItem(at: decodedVoiceMessageURL)
+        self.decodedVoiceMessageURL = nil
     }
 
     private func announce(_ message: String) {
@@ -1072,6 +1092,7 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     fileprivate func playbackDidFinish(successfully: Bool) {
         playingVoiceFileID = nil
         audioPlayer = nil
+        removeDecodedVoiceMessage()
         updatePlaybackStatus(successfully ? "Voice playback finished" : "Voice playback stopped")
     }
 

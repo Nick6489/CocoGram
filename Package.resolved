@@ -1,6 +1,24 @@
 {
-  "originHash" : "e03558b2efdb4b6ecc1a7f94cba52385f94f1187bfdcf2538fd0e3229d2eb224",
+  "originHash" : "1d748f2e51ac1987be652591f8c9302e8ce2bedbf477b80afc334c8d8091aae7",
   "pins" : [
+    {
+      "identity" : "ogg-binary-xcframework",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sbooth/ogg-binary-xcframework",
+      "state" : {
+        "revision" : "48cbf24e7fb5d329b1f5e24cd2e5b048585ff770",
+        "version" : "0.1.3"
+      }
+    },
+    {
+      "identity" : "opus-binary-xcframework",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sbooth/opus-binary-xcframework",
+      "state" : {
+        "revision" : "8e23828b9d88f0ff1ff2d7c4bcb65739a4bdeff8",
+        "version" : "0.3.0"
+      }
+    },
     {
       "identity" : "tdlibframework",
       "kind" : "remoteSourceControl",

@@ -38,6 +38,7 @@ APP="$DIST/$APP_NAME.app"
 CONTENTS="$APP/Contents"
 MACOS_DIR="$CONTENTS/MacOS"
 RES_DIR="$CONTENTS/Resources"
+FRAMEWORKS_DIR="$CONTENTS/Frameworks"
 BIN_SRC="$ROOT/.build/release/$APP_NAME"
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -50,9 +51,12 @@ swift build -c release
 # ---- 2. Assemble the .app skeleton -------------------------------------------------
 say "Assembling $APP_NAME.app"
 rm -rf "$APP"
-mkdir -p "$MACOS_DIR" "$RES_DIR"
+mkdir -p "$MACOS_DIR" "$RES_DIR" "$FRAMEWORKS_DIR"
 cp "$BIN_SRC" "$MACOS_DIR/$APP_NAME"
 chmod +x "$MACOS_DIR/$APP_NAME"
+cp -R "$ROOT/.build/release/ogg.framework" "$FRAMEWORKS_DIR/"
+cp -R "$ROOT/.build/release/opus.framework" "$FRAMEWORKS_DIR/"
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS_DIR/$APP_NAME"
 
 # ---- 3. Info.plist -----------------------------------------------------------------
 say "Writing Info.plist"
@@ -87,8 +91,10 @@ rm -rf "$ICONSET"
 
 # ---- 5. Code signing (hardened runtime, required for notarization) -----------------
 say "Code signing with: $SIGN_IDENTITY"
-# No nested dynamic frameworks (TDLib is statically linked), so a single sign of the
-# .app suffices. Hardened runtime via --options runtime; --timestamp for notarization.
+codesign --force --options runtime --timestamp \
+    --sign "$SIGN_IDENTITY" "$FRAMEWORKS_DIR/ogg.framework"
+codesign --force --options runtime --timestamp \
+    --sign "$SIGN_IDENTITY" "$FRAMEWORKS_DIR/opus.framework"
 codesign --force --options runtime --timestamp \
     --sign "$SIGN_IDENTITY" "$APP"
 
