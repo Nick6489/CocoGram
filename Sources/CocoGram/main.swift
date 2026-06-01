@@ -678,6 +678,8 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     private let playbackStatusLabel = NSTextField(labelWithString: "Voice playback: idle")
     private let playbackSpeedPopUp = NSPopUpButton()
     private let playbackVolumeSlider = NSSlider(value: 1, minValue: 0, maxValue: 1, target: nil, action: nil)
+    private let playbackControls = NSStackView()
+    private let playbackSeparator = NSBox()
     private var recordingDialogController: RecordingDialogController?
     private var messages: [Message] = []
     private var currentConversationID: Int64?
@@ -797,11 +799,14 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         playbackVolumeSlider.setAccessibilityLabel("Voice playback volume")
         playbackVolumeSlider.setAccessibilityHelp("Adjusts voice message playback volume. Command Up and Command Down also change volume.")
 
-        let playbackControls = NSStackView(views: [playbackStatusLabel, NSView(), speedLabel, playbackSpeedPopUp, volumeLabel, playbackVolumeSlider])
+        playbackControls.setViews([playbackStatusLabel, NSView(), speedLabel, playbackSpeedPopUp, volumeLabel, playbackVolumeSlider], in: .leading)
         playbackControls.orientation = .horizontal
         playbackControls.alignment = .centerY
         playbackControls.spacing = 8
         playbackControls.edgeInsets = NSEdgeInsets(top: 8, left: 22, bottom: 8, right: 22)
+        playbackControls.isHidden = true
+        playbackSeparator.boxType = .separator
+        playbackSeparator.isHidden = true
 
         let composer = NSStackView(views: [attachButton, composerField, recordButton, sendButton])
         composer.orientation = .horizontal
@@ -809,7 +814,7 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         composer.spacing = 8
         composer.edgeInsets = NSEdgeInsets(top: 12, left: 22, bottom: 16, right: 22)
 
-        let root = NSStackView(views: [header, separator(), messageScrollView, infoScrollView, separator(), playbackControls, separator(), composer])
+        let root = NSStackView(views: [header, separator(), messageScrollView, infoScrollView, separator(), playbackControls, playbackSeparator, composer])
         root.orientation = .vertical
         root.spacing = 0
         root.translatesAutoresizingMaskIntoConstraints = false
@@ -834,6 +839,13 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     func show(item: DetailItem) {
+        if case .conversation(let conversation) = item {
+            if currentConversationID != conversation.id {
+                stopVoicePlayback()
+            }
+        } else {
+            stopVoicePlayback()
+        }
         headerTitle.stringValue = item.title
         headerSubtitle.stringValue = item.subtitle
         headerTitle.setAccessibilityLabel(item.title)
@@ -918,7 +930,6 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         if notification.object as? NSTableView === messageTableView {
-            playVoiceMessageIfPresent(at: messageTableView.selectedRow)
             return
         }
     }
@@ -938,9 +949,6 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
         if tableView === messageTableView {
-            if tableView.selectedRow == row {
-                playVoiceMessageIfPresent(at: row)
-            }
             return row >= 0 && row < messages.count
         }
         return true
@@ -1037,6 +1045,17 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     private func updatePlaybackStatus(_ status: String) {
         playbackStatusLabel.stringValue = status
         playbackStatusLabel.setAccessibilityLabel(status)
+        playbackControls.isHidden = playingVoiceFileID == nil
+        playbackSeparator.isHidden = playingVoiceFileID == nil
+    }
+
+    private func stopVoicePlayback() {
+        playbackTask?.cancel()
+        playbackTask = nil
+        audioPlayer?.stop()
+        audioPlayer = nil
+        playingVoiceFileID = nil
+        updatePlaybackStatus("Voice playback: idle")
     }
 
     private func announce(_ message: String) {
@@ -1193,7 +1212,9 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let cell = MessageTableCellView()
-        cell.configure(message: messages[row])
+        cell.configure(message: messages[row]) { [weak self] in
+            self?.playVoiceMessageIfPresent(at: row)
+        }
         return cell
     }
 
@@ -1756,6 +1777,7 @@ final class MessageTableCellView: NSTableCellView {
     private let timeLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private let voiceContainer = NSStackView()
+    private let voicePlayButton = NSButton()
     private let voiceTranscriptLabel = NSTextField(wrappingLabelWithString: "")
     private let mediaContainer = NSStackView()
     private let mediaIcon = NSImageView()
@@ -1771,9 +1793,10 @@ final class MessageTableCellView: NSTableCellView {
         nil
     }
 
-    func configure(message: Message) {
+    func configure(message: Message, onPlayVoiceMessage: @escaping () -> Void) {
         accessibilitySummary = message.accessibilitySummary
         setAccessibilityLabel(accessibilitySummary)
+        self.onPlayVoiceMessage = onPlayVoiceMessage
 
         senderLabel.stringValue = message.isOutgoing ? "You" : message.sender
         timeLabel.stringValue = message.time
@@ -1836,10 +1859,12 @@ final class MessageTableCellView: NSTableCellView {
         metadataStack.spacing = 8
         metadataStack.setAccessibilityElement(false)
 
-        let playIcon = NSImageView(image: NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: nil) ?? NSImage())
-        playIcon.symbolConfiguration = .init(pointSize: 22, weight: .regular)
-        playIcon.contentTintColor = .controlAccentColor
-        playIcon.setAccessibilityElement(false)
+        voicePlayButton.image = NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: "Play voice message")
+        voicePlayButton.bezelStyle = .texturedRounded
+        voicePlayButton.target = self
+        voicePlayButton.action = #selector(playVoiceMessage)
+        voicePlayButton.setAccessibilityLabel("Play voice message")
+        voicePlayButton.setAccessibilityHelp("Downloads and plays this voice message. Activate again to pause or resume playback.")
 
         voiceTranscriptLabel.font = .systemFont(ofSize: 13)
         voiceTranscriptLabel.textColor = .secondaryLabelColor
@@ -1849,7 +1874,7 @@ final class MessageTableCellView: NSTableCellView {
         voiceContainer.orientation = .horizontal
         voiceContainer.alignment = .centerY
         voiceContainer.spacing = 8
-        voiceContainer.addArrangedSubview(playIcon)
+        voiceContainer.addArrangedSubview(voicePlayButton)
         voiceContainer.addArrangedSubview(voiceTranscriptLabel)
         voiceContainer.setAccessibilityElement(false)
 
@@ -1888,6 +1913,12 @@ final class MessageTableCellView: NSTableCellView {
     override func accessibilityLabel() -> String? {
         accessibilitySummary
     }
+
+    @objc private func playVoiceMessage() {
+        onPlayVoiceMessage?()
+    }
+
+    private var onPlayVoiceMessage: (() -> Void)?
 }
 
 final class MessageBubbleView: NSView {
