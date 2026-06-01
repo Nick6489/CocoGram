@@ -1631,6 +1631,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     private let playPauseButton = NSButton(title: "Pause", target: nil, action: nil)
     private let stopButton = NSButton(title: "Stop", target: nil, action: nil)
     private let sendButton = NSButton(title: "Send", target: nil, action: nil)
+    private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
     private var state: RecordingState = .preparing
     private var timer: Timer?
     private var recorder: AVAudioRecorder?
@@ -1638,6 +1639,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     private var recordingURL: URL?
     private var recordedDuration: TimeInterval = 0
     private var didTransferRecording = false
+    private var isClosing = false
 
     override func loadView() {
         view = NSView()
@@ -1671,7 +1673,14 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         sendButton.action = #selector(sendRecording)
         sendButton.setAccessibilityHelp("Sends this recorded voice message.")
 
-        let controls = NSStackView(views: [playPauseButton, stopButton, sendButton])
+        cancelButton.bezelStyle = .rounded
+        cancelButton.keyEquivalent = "\u{1b}"
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelRecording)
+        cancelButton.setAccessibilityLabel("Cancel recording")
+        cancelButton.setAccessibilityHelp("Discards this recorded voice message.")
+
+        let controls = NSStackView(views: [playPauseButton, stopButton, sendButton, cancelButton])
         controls.orientation = .horizontal
         controls.alignment = .centerY
         controls.distribution = .fillEqually
@@ -1707,6 +1716,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
 
     override func viewWillDisappear() {
         super.viewWillDisappear()
+        isClosing = true
         timer?.invalidate()
         finishRecording()
         previewPlayer?.stop()
@@ -1754,6 +1764,10 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         closeSheet()
     }
 
+    @objc private func cancelRecording() {
+        closeSheet()
+    }
+
     private func updateState(_ newState: RecordingState) {
         state = newState
 
@@ -1769,6 +1783,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             playPauseButton.title = "Pause"
             playPauseButton.setAccessibilityLabel("Pause recording")
             playPauseButton.setAccessibilityHelp("Pauses the current voice message recording.")
+            playPauseButton.isEnabled = true
             stopButton.isEnabled = true
             sendButton.isEnabled = true
         case .recordingPaused:
@@ -1776,6 +1791,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             playPauseButton.title = "Record"
             playPauseButton.setAccessibilityLabel("Resume recording")
             playPauseButton.setAccessibilityHelp("Resumes recording this voice message.")
+            playPauseButton.isEnabled = true
             stopButton.isEnabled = true
             sendButton.isEnabled = true
         case .previewReady:
@@ -1783,6 +1799,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             playPauseButton.title = "Play"
             playPauseButton.setAccessibilityLabel("Play recording")
             playPauseButton.setAccessibilityHelp("Plays the recorded voice message preview.")
+            playPauseButton.isEnabled = true
             stopButton.isEnabled = false
             sendButton.isEnabled = true
         case .previewPlaying:
@@ -1790,6 +1807,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             playPauseButton.title = "Pause"
             playPauseButton.setAccessibilityLabel("Pause playback")
             playPauseButton.setAccessibilityHelp("Pauses playback of the recorded voice message preview.")
+            playPauseButton.isEnabled = true
             stopButton.isEnabled = false
             sendButton.isEnabled = true
         case .previewPaused:
@@ -1797,6 +1815,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             playPauseButton.title = "Play"
             playPauseButton.setAccessibilityLabel("Resume playback")
             playPauseButton.setAccessibilityHelp("Resumes playback of the recorded voice message preview.")
+            playPauseButton.isEnabled = true
             stopButton.isEnabled = false
             sendButton.isEnabled = true
         }
@@ -1850,6 +1869,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             permissionGranted = false
         }
 
+        guard !isClosing else { return }
         guard permissionGranted else {
             showRecordingError("Microphone access is required to record a voice message.")
             return
