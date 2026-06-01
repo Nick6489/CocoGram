@@ -408,6 +408,8 @@ final class SidebarViewController: NSViewController, NSTableViewDataSource, NSTa
 final class ItemListViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     var onSelect: ((DetailItem) -> Void)?
 
+    private static let lastSelectedConversationIDKey = "lastSelectedConversationID"
+
     private let telegramClient: TelegramClient
     private let titleLabel = NSTextField(labelWithString: "")
     private let searchField = NSSearchField()
@@ -499,7 +501,7 @@ final class ItemListViewController: NSViewController, NSTableViewDataSource, NST
                 self.items = loadedItems
                 self.tableView.reloadData()
                 if !loadedItems.isEmpty {
-                    self.selectItem(at: 0)
+                    self.selectItem(at: self.initialSelectionIndex(in: loadedItems, for: section))
                 }
             } catch {
                 self.items = []
@@ -562,12 +564,30 @@ final class ItemListViewController: NSViewController, NSTableViewDataSource, NST
         guard row >= 0, row < items.count else { return }
         let item = items[row]
         selectedItem = item
+        if case .conversation(let conversation) = item {
+            UserDefaults.standard.set(conversation.id, forKey: Self.lastSelectedConversationIDKey)
+        }
         if tableView.selectedRow != row {
             isSelectingProgrammatically = true
             tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
             isSelectingProgrammatically = false
         }
         onSelect?(item)
+    }
+
+    private func initialSelectionIndex(in items: [DetailItem], for section: NavigationSection) -> Int {
+        guard
+            section == .chats,
+            let conversationID = UserDefaults.standard.object(forKey: Self.lastSelectedConversationIDKey) as? NSNumber,
+            let index = items.firstIndex(where: { item in
+                guard case .conversation(let conversation) = item else { return false }
+                return conversation.id == conversationID.int64Value
+            })
+        else {
+            return 0
+        }
+
+        return index
     }
 }
 
