@@ -1618,9 +1618,10 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     enum RecordingState {
         case preparing
         case recording
-        case paused
-        case stopped
-        case playing
+        case recordingPaused
+        case previewReady
+        case previewPlaying
+        case previewPaused
     }
 
     var onSend: ((URL, TimeInterval) -> Void)?
@@ -1720,25 +1721,27 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             return
         case .recording:
             recorder?.pause()
-            updateState(.paused)
+            updateState(.recordingPaused)
             timer?.invalidate()
-        case .paused:
+        case .recordingPaused:
             recorder?.record()
             updateState(.recording)
             startTimer()
-        case .stopped:
-            playPreview()
-        case .playing:
+        case .previewReady:
+            playPreview(restarting: true)
+        case .previewPlaying:
             previewPlayer?.pause()
-            updateState(.stopped)
+            updateState(.previewPaused)
             timer?.invalidate()
+        case .previewPaused:
+            playPreview(restarting: false)
         }
     }
 
     @objc private func stopRecording() {
         timer?.invalidate()
         finishRecording()
-        updateState(.stopped)
+        updateState(.previewReady)
     }
 
     @objc private func sendRecording() {
@@ -1768,25 +1771,32 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             playPauseButton.setAccessibilityHelp("Pauses the current voice message recording.")
             stopButton.isEnabled = true
             sendButton.isEnabled = true
-        case .paused:
+        case .recordingPaused:
             statusLabel.stringValue = "Recording paused"
             playPauseButton.title = "Record"
             playPauseButton.setAccessibilityLabel("Resume recording")
             playPauseButton.setAccessibilityHelp("Resumes recording this voice message.")
             stopButton.isEnabled = true
             sendButton.isEnabled = true
-        case .stopped:
+        case .previewReady:
             statusLabel.stringValue = "Recording stopped"
             playPauseButton.title = "Play"
             playPauseButton.setAccessibilityLabel("Play recording")
             playPauseButton.setAccessibilityHelp("Plays the recorded voice message preview.")
             stopButton.isEnabled = false
             sendButton.isEnabled = true
-        case .playing:
+        case .previewPlaying:
             statusLabel.stringValue = "Playing recording"
             playPauseButton.title = "Pause"
             playPauseButton.setAccessibilityLabel("Pause playback")
             playPauseButton.setAccessibilityHelp("Pauses playback of the recorded voice message preview.")
+            stopButton.isEnabled = false
+            sendButton.isEnabled = true
+        case .previewPaused:
+            statusLabel.stringValue = "Playback paused"
+            playPauseButton.title = "Play"
+            playPauseButton.setAccessibilityLabel("Resume playback")
+            playPauseButton.setAccessibilityHelp("Resumes playback of the recorded voice message preview.")
             stopButton.isEnabled = false
             sendButton.isEnabled = true
         }
@@ -1803,6 +1813,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     private func finishRecording() {
         recordedDuration = max(recordedDuration, recorder?.currentTime ?? 0)
         recorder?.stop()
+        recorder = nil
     }
 
     @objc private func tickElapsed() {
@@ -1810,7 +1821,17 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     }
 
     private func updateElapsedLabel() {
-        let elapsed = state == .playing ? previewPlayer?.currentTime ?? 0 : recorder?.currentTime ?? recordedDuration
+        let elapsed: TimeInterval
+        switch state {
+        case .preparing:
+            elapsed = 0
+        case .recording, .recordingPaused:
+            elapsed = recorder?.currentTime ?? recordedDuration
+        case .previewReady:
+            elapsed = recordedDuration
+        case .previewPlaying, .previewPaused:
+            elapsed = previewPlayer?.currentTime ?? 0
+        }
         let elapsedSeconds = Int(elapsed)
         elapsedLabel.stringValue = String(format: "%d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
         elapsedLabel.setAccessibilityLabel("Elapsed time \(Message.format(TimeInterval(elapsedSeconds)))")
@@ -1863,15 +1884,19 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         }
     }
 
-    private func playPreview() {
+    private func playPreview(restarting: Bool) {
         guard let recordingURL else { return }
         do {
             let player = try previewPlayer ?? AVAudioPlayer(contentsOf: recordingURL)
             player.delegate = self
-            player.prepareToPlay()
+            if restarting {
+                player.currentTime = 0
+            }
+            guard player.prepareToPlay(), player.play() else {
+                throw CocoaError(.fileReadUnknown)
+            }
             previewPlayer = player
-            player.play()
-            updateState(.playing)
+            updateState(.previewPlaying)
             startTimer()
         } catch {
             showRecordingError("Couldn't play the recording preview: \(error.localizedDescription)")
@@ -1902,9 +1927,10 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard previewPlayer === player else { return }
             timer?.invalidate()
             previewPlayer?.currentTime = 0
-            updateState(.stopped)
+            updateState(.previewReady)
         }
     }
 
