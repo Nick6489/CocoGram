@@ -18,7 +18,7 @@ enum NavigationSection: String, CaseIterable {
 
 enum MessageKind {
     case text(String)
-    case voice(duration: TimeInterval, transcript: String)
+    case voice(duration: TimeInterval, transcript: String, fileID: Int?)
     /// Any non-text, non-voice content (photo, video, sticker, document, audio, etc.).
     /// `icon` is an SF Symbol name; `label` is a self-contained human description
     /// (already including any caption) so it reads naturally on its own to VoiceOver.
@@ -28,7 +28,7 @@ enum MessageKind {
         switch self {
         case .text(let body):
             return body
-        case .voice(let duration, let transcript):
+        case .voice(let duration, let transcript, _):
             return "Voice message, \(Message.format(duration)), transcript: \(transcript)"
         case .media(_, let label):
             return label

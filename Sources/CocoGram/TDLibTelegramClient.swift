@@ -228,6 +228,23 @@ final class TDLibTelegramClient: TelegramClient {
         []
     }
 
+    func downloadVoiceMessage(fileID: Int) async throws -> URL {
+        let file: TDLibKit.File = try await runTDLibRequest { completion in
+            try tdClient.downloadFile(
+                fileId: fileID,
+                limit: 0,
+                offset: 0,
+                priority: 32,
+                synchronous: true,
+                completion: completion
+            )
+        }
+        guard file.local.isDownloadingCompleted, !file.local.path.isEmpty else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return URL(fileURLWithPath: file.local.path)
+    }
+
     func sendText(_ text: String, chatID: Int64) async throws -> Message {
         let content = InputMessageContent.inputMessageText(
             InputMessageText(
@@ -442,7 +459,11 @@ final class TDLibTelegramClient: TelegramClient {
             return .text(text.text.text)
         case .messageVoiceNote(let voiceNote):
             let transcript = voiceTranscript(voiceNote)
-            return .voice(duration: TimeInterval(voiceNote.voiceNote.duration), transcript: transcript)
+            return .voice(
+                duration: TimeInterval(voiceNote.voiceNote.duration),
+                transcript: transcript,
+                fileID: voiceNote.voiceNote.voice.id
+            )
         default:
             let summary = mediaSummary(content)
             return .media(icon: summary.icon, label: summary.label)

@@ -1,4 +1,5 @@
 import AppKit
+@preconcurrency import AVFoundation
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -161,6 +162,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
+        let playbackMenuItem = NSMenuItem()
+        mainMenu.addItem(playbackMenuItem)
+        let playbackMenu = NSMenu(title: "Playback")
+        playbackMenuItem.submenu = playbackMenu
+        let slower = playbackMenu.addItem(withTitle: "Slower", action: #selector(decreaseVoicePlaybackSpeed(_:)), keyEquivalent: "[")
+        slower.target = self
+        let faster = playbackMenu.addItem(withTitle: "Faster", action: #selector(increaseVoicePlaybackSpeed(_:)), keyEquivalent: "]")
+        faster.target = self
+        playbackMenu.addItem(.separator())
+        let volumeDown = playbackMenu.addItem(withTitle: "Volume Down", action: #selector(decreaseVoicePlaybackVolume(_:)), keyEquivalent: "\u{F701}")
+        volumeDown.keyEquivalentModifierMask = [.command]
+        volumeDown.target = self
+        let volumeUp = playbackMenu.addItem(withTitle: "Volume Up", action: #selector(increaseVoicePlaybackVolume(_:)), keyEquivalent: "\u{F700}")
+        volumeUp.keyEquivalentModifierMask = [.command]
+        volumeUp.target = self
+
         // Window menu — standard window management; NSApp.windowsMenu wires it up.
         let windowMenuItem = NSMenuItem()
         mainMenu.addItem(windowMenuItem)
@@ -173,6 +190,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.windowsMenu = windowMenu
 
         return mainMenu
+    }
+
+    @objc private func decreaseVoicePlaybackSpeed(_ sender: Any?) {
+        windowController?.decreaseVoicePlaybackSpeed()
+    }
+
+    @objc private func increaseVoicePlaybackSpeed(_ sender: Any?) {
+        windowController?.increaseVoicePlaybackSpeed()
+    }
+
+    @objc private func decreaseVoicePlaybackVolume(_ sender: Any?) {
+        windowController?.decreaseVoicePlaybackVolume()
+    }
+
+    @objc private func increaseVoicePlaybackVolume(_ sender: Any?) {
+        windowController?.increaseVoicePlaybackVolume()
     }
 
     private func observeTelegramUpdates() async {
@@ -280,6 +313,22 @@ final class MainWindowController: NSWindowController {
     func showChats() {
         (contentViewController as? RootViewController)?.showChats()
     }
+
+    func decreaseVoicePlaybackSpeed() {
+        (contentViewController as? RootViewController)?.decreaseVoicePlaybackSpeed()
+    }
+
+    func increaseVoicePlaybackSpeed() {
+        (contentViewController as? RootViewController)?.increaseVoicePlaybackSpeed()
+    }
+
+    func decreaseVoicePlaybackVolume() {
+        (contentViewController as? RootViewController)?.decreaseVoicePlaybackVolume()
+    }
+
+    func increaseVoicePlaybackVolume() {
+        (contentViewController as? RootViewController)?.increaseVoicePlaybackVolume()
+    }
 }
 
 final class RootViewController: NSSplitViewController {
@@ -325,6 +374,22 @@ final class RootViewController: NSSplitViewController {
 
     func showChats() {
         sidebarController.select(section: .chats)
+    }
+
+    func decreaseVoicePlaybackSpeed() {
+        detailController.decreasePlaybackSpeed(nil)
+    }
+
+    func increaseVoicePlaybackSpeed() {
+        detailController.increasePlaybackSpeed(nil)
+    }
+
+    func decreaseVoicePlaybackVolume() {
+        detailController.decreasePlaybackVolume(nil)
+    }
+
+    func increaseVoicePlaybackVolume() {
+        detailController.increasePlaybackVolume(nil)
     }
 }
 
@@ -592,6 +657,8 @@ final class ItemListViewController: NSViewController, NSTableViewDataSource, NST
 }
 
 final class DetailViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
+    private static let playbackRates: [Float] = [0.5, 0.75, 1, 1.25, 1.5, 2]
+
     private let telegramClient: TelegramClient
     private let headerTitle = NSTextField(labelWithString: "Select a chat")
     private let headerSubtitle = NSTextField(labelWithString: "")
@@ -604,9 +671,15 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     private let sendButton = NSButton(title: "Send", target: nil, action: nil)
     private let attachButton = NSButton(image: NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attach file") ?? NSImage(), target: nil, action: nil)
     private let recordButton = NSButton(image: NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Record message") ?? NSImage(), target: nil, action: nil)
+    private let playbackStatusLabel = NSTextField(labelWithString: "Voice playback: idle")
+    private let playbackSpeedPopUp = NSPopUpButton()
+    private let playbackVolumeSlider = NSSlider(value: 1, minValue: 0, maxValue: 1, target: nil, action: nil)
     private var recordingDialogController: RecordingDialogController?
     private var messages: [Message] = []
     private var currentConversationID: Int64?
+    private var audioPlayer: AVAudioPlayer?
+    private var playingVoiceFileID: Int?
+    private var playbackTask: Task<Void, Never>?
 
     init(telegramClient: TelegramClient) {
         self.telegramClient = telegramClient
@@ -701,13 +774,38 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         sendButton.action = #selector(sendTextMessage)
         sendButton.setAccessibilityLabel("Send message")
 
+        playbackStatusLabel.font = .systemFont(ofSize: 12)
+        playbackStatusLabel.textColor = .secondaryLabelColor
+        playbackStatusLabel.setAccessibilityLabel("Voice playback idle")
+
+        let speedLabel = NSTextField(labelWithString: "Speed")
+        speedLabel.font = .systemFont(ofSize: 12)
+        playbackSpeedPopUp.addItems(withTitles: Self.playbackRates.map { "\($0)x" })
+        playbackSpeedPopUp.selectItem(at: 2)
+        playbackSpeedPopUp.target = self
+        playbackSpeedPopUp.action = #selector(playbackSpeedChanged)
+        playbackSpeedPopUp.setAccessibilityLabel("Voice playback speed")
+
+        let volumeLabel = NSTextField(labelWithString: "Volume")
+        volumeLabel.font = .systemFont(ofSize: 12)
+        playbackVolumeSlider.target = self
+        playbackVolumeSlider.action = #selector(playbackVolumeChanged)
+        playbackVolumeSlider.setAccessibilityLabel("Voice playback volume")
+        playbackVolumeSlider.setAccessibilityHelp("Adjusts voice message playback volume. Command Up and Command Down also change volume.")
+
+        let playbackControls = NSStackView(views: [playbackStatusLabel, NSView(), speedLabel, playbackSpeedPopUp, volumeLabel, playbackVolumeSlider])
+        playbackControls.orientation = .horizontal
+        playbackControls.alignment = .centerY
+        playbackControls.spacing = 8
+        playbackControls.edgeInsets = NSEdgeInsets(top: 8, left: 22, bottom: 8, right: 22)
+
         let composer = NSStackView(views: [attachButton, composerField, recordButton, sendButton])
         composer.orientation = .horizontal
         composer.alignment = .centerY
         composer.spacing = 8
         composer.edgeInsets = NSEdgeInsets(top: 12, left: 22, bottom: 16, right: 22)
 
-        let root = NSStackView(views: [header, separator(), messageScrollView, infoScrollView, separator(), composer])
+        let root = NSStackView(views: [header, separator(), messageScrollView, infoScrollView, separator(), playbackControls, separator(), composer])
         root.orientation = .vertical
         root.spacing = 0
         root.translatesAutoresizingMaskIntoConstraints = false
@@ -723,6 +821,8 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
             messageScrollView.widthAnchor.constraint(equalTo: root.widthAnchor),
             messageScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 260),
             infoScrollView.widthAnchor.constraint(equalTo: root.widthAnchor),
+            playbackControls.widthAnchor.constraint(equalTo: root.widthAnchor),
+            playbackVolumeSlider.widthAnchor.constraint(equalToConstant: 110),
             infoScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 260),
             composer.widthAnchor.constraint(equalTo: root.widthAnchor),
             composerField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220)
@@ -814,6 +914,7 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         if notification.object as? NSTableView === messageTableView {
+            playVoiceMessageIfPresent(at: messageTableView.selectedRow)
             return
         }
     }
@@ -833,9 +934,122 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
         if tableView === messageTableView {
+            if tableView.selectedRow == row {
+                playVoiceMessageIfPresent(at: row)
+            }
             return row >= 0 && row < messages.count
         }
         return true
+    }
+
+    private func playVoiceMessageIfPresent(at row: Int) {
+        guard row >= 0, row < messages.count else { return }
+        guard case .voice(_, _, let fileID) = messages[row].kind else { return }
+        guard let fileID else {
+            updatePlaybackStatus("Voice playback unavailable")
+            return
+        }
+
+        if playingVoiceFileID == fileID, let audioPlayer {
+            if audioPlayer.isPlaying {
+                audioPlayer.pause()
+                updatePlaybackStatus("Voice playback paused")
+            } else {
+                audioPlayer.play()
+                updatePlaybackStatus("Playing voice message")
+            }
+            return
+        }
+
+        playbackTask?.cancel()
+        audioPlayer?.stop()
+        playingVoiceFileID = fileID
+        updatePlaybackStatus("Downloading voice message")
+
+        playbackTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let url = try await telegramClient.downloadVoiceMessage(fileID: fileID)
+                guard !Task.isCancelled, playingVoiceFileID == fileID else { return }
+                let player = try AVAudioPlayer(contentsOf: url)
+                player.delegate = self
+                player.enableRate = true
+                player.rate = selectedPlaybackRate
+                player.volume = Float(playbackVolumeSlider.doubleValue)
+                player.prepareToPlay()
+                audioPlayer = player
+                player.play()
+                updatePlaybackStatus("Playing voice message")
+            } catch {
+                guard !Task.isCancelled, playingVoiceFileID == fileID else { return }
+                playingVoiceFileID = nil
+                updatePlaybackStatus("Voice playback failed")
+                announce("Couldn't play that voice message: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    @objc func decreasePlaybackSpeed(_ sender: Any?) {
+        adjustPlaybackSpeed(by: -1)
+    }
+
+    @objc func increasePlaybackSpeed(_ sender: Any?) {
+        adjustPlaybackSpeed(by: 1)
+    }
+
+    @objc func decreasePlaybackVolume(_ sender: Any?) {
+        adjustPlaybackVolume(by: -0.1)
+    }
+
+    @objc func increasePlaybackVolume(_ sender: Any?) {
+        adjustPlaybackVolume(by: 0.1)
+    }
+
+    @objc private func playbackSpeedChanged() {
+        audioPlayer?.rate = selectedPlaybackRate
+        announce("Voice playback speed \(selectedPlaybackRate)x")
+    }
+
+    @objc private func playbackVolumeChanged() {
+        audioPlayer?.volume = Float(playbackVolumeSlider.doubleValue)
+        announce("Voice playback volume \(Int(playbackVolumeSlider.doubleValue * 100)) percent")
+    }
+
+    private func adjustPlaybackSpeed(by offset: Int) {
+        let index = min(max(playbackSpeedPopUp.indexOfSelectedItem + offset, 0), Self.playbackRates.count - 1)
+        playbackSpeedPopUp.selectItem(at: index)
+        playbackSpeedChanged()
+    }
+
+    private func adjustPlaybackVolume(by offset: Double) {
+        playbackVolumeSlider.doubleValue = min(max(playbackVolumeSlider.doubleValue + offset, 0), 1)
+        playbackVolumeChanged()
+    }
+
+    private var selectedPlaybackRate: Float {
+        Self.playbackRates[playbackSpeedPopUp.indexOfSelectedItem]
+    }
+
+    private func updatePlaybackStatus(_ status: String) {
+        playbackStatusLabel.stringValue = status
+        playbackStatusLabel.setAccessibilityLabel(status)
+    }
+
+    private func announce(_ message: String) {
+        NSAccessibility.post(
+            element: view,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue
+            ]
+        )
+    }
+
+    fileprivate func playbackDidFinish(successfully: Bool) {
+        playingVoiceFileID = nil
+        audioPlayer = nil
+        updatePlaybackStatus(successfully ? "Voice playback finished" : "Voice playback stopped")
     }
 
     private func showContact(_ contact: Contact) {
@@ -987,6 +1201,14 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
             return 124
         case .media:
             return 92
+        }
+    }
+}
+
+extension DetailViewController: AVAudioPlayerDelegate {
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor [weak self] in
+            self?.playbackDidFinish(successfully: flag)
         }
     }
 }
@@ -1560,7 +1782,7 @@ final class MessageTableCellView: NSTableCellView {
             bodyLabel.isHidden = false
             voiceContainer.isHidden = true
             mediaContainer.isHidden = true
-        case .voice(let duration, let transcript):
+        case .voice(let duration, let transcript, _):
             bodyLabel.isHidden = true
             voiceContainer.isHidden = false
             mediaContainer.isHidden = true
@@ -1699,7 +1921,7 @@ final class MessageBubbleView: NSView {
             text.maximumNumberOfLines = 0
             text.setAccessibilityElement(false)
             bodyView = text
-        case .voice(let duration, let transcript):
+        case .voice(let duration, let transcript, _):
             bodyView = VoiceMessageView(duration: duration, transcript: transcript)
             bodyView.setAccessibilityElement(false)
         case .media(let icon, let label):
@@ -1757,7 +1979,7 @@ final class VoiceMessageView: NSView {
         progress.isIndeterminate = false
         progress.minValue = 0
         progress.maxValue = duration
-        progress.doubleValue = duration * 0.62
+        progress.doubleValue = 0
         progress.controlSize = .small
         progress.setAccessibilityElement(false)
 

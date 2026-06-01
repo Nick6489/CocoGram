@@ -48,7 +48,7 @@ final class DummyTelegramClient: TelegramClient {
         messagesByChatID = [
             1: [
                 Message(sender: "Maya", time: "9:31 AM", isOutgoing: false, kind: .text("Can we make the first-run flow friendly for VoiceOver from day one?"), outgoingStatus: nil),
-                Message(sender: "Maya", time: "9:33 AM", isOutgoing: false, kind: .voice(duration: 42, transcript: "I walked through the contact picker and the order feels right. The compose field should announce attachment state."), outgoingStatus: nil),
+                Message(sender: "Maya", time: "9:33 AM", isOutgoing: false, kind: .voice(duration: 42, transcript: "I walked through the contact picker and the order feels right. The compose field should announce attachment state.", fileID: nil), outgoingStatus: nil),
                 Message(sender: "You", time: "9:38 AM", isOutgoing: true, kind: .text("Yes. I am adding labels and actions directly to the controls instead of treating accessibility as a pass at the end."), outgoingStatus: .read)
             ],
             2: [
@@ -110,6 +110,10 @@ final class DummyTelegramClient: TelegramClient {
         calls
     }
 
+    func downloadVoiceMessage(fileID: Int) async throws -> URL {
+        throw CocoaError(.fileNoSuchFile)
+    }
+
     func sendText(_ text: String, chatID: Int64) async throws -> Message {
         let message = Message(sender: "You", time: "Just now", isOutgoing: true, kind: .text(text), outgoingStatus: .sent)
         messagesByChatID[chatID, default: []].append(message)
@@ -122,7 +126,7 @@ final class DummyTelegramClient: TelegramClient {
             sender: "You",
             time: "Just now",
             isOutgoing: true,
-            kind: .voice(duration: max(duration, 1), transcript: "Transcript pending for recorded voice message."),
+            kind: .voice(duration: max(duration, 1), transcript: "Transcript pending for recorded voice message.", fileID: nil),
             outgoingStatus: .sent
         )
         messagesByChatID[chatID, default: []].append(message)
