@@ -77,6 +77,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key> <true/>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSApplicationCategoryType</key> <string>public.app-category.social-networking</string>
+    <key>NSMicrophoneUsageDescription</key> <string>CocoGram uses the microphone to record voice messages.</string>
 </dict>
 </plist>
 PLIST

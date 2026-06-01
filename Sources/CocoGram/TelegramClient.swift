@@ -33,5 +33,5 @@ protocol TelegramClient: AnyObject {
     func loadCalls() async throws -> [CallRecord]
     func downloadVoiceMessage(fileID: Int) async throws -> URL
     func sendText(_ text: String, chatID: Int64) async throws -> Message
-    func sendVoiceMessage(duration: TimeInterval, chatID: Int64) async throws -> Message
+    func sendVoiceMessage(fileURL: URL, duration: TimeInterval, chatID: Int64) async throws -> Message
 }

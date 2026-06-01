@@ -113,14 +113,11 @@ struct TDLibConfiguration {
 
 enum TDLibTelegramClientError: LocalizedError {
     case clientNotStarted
-    case unsupportedVoiceMessagePlaceholder
 
     var errorDescription: String? {
         switch self {
         case .clientNotStarted:
             return "TDLib client has not been started."
-        case .unsupportedVoiceMessagePlaceholder:
-            return "Voice-message upload needs a recorded audio file before it can be sent through TDLib."
         }
     }
 }
@@ -136,6 +133,7 @@ final class TDLibTelegramClient: TelegramClient {
     private var chatCache: [Int64: TDLibKit.Chat] = [:]
     private var userCache: [Int64: TDLibKit.User] = [:]
     private var chatLastMessageCache: [Int64: TDLibKit.Message?] = [:]
+    private var pendingVoiceUploadURLs: [Int: URL] = [:]
     private var isStopping = false
 
     init(configuration: TDLibConfiguration) {
@@ -159,6 +157,9 @@ final class TDLibTelegramClient: TelegramClient {
     func stop() {
         guard !isStopping else { return }
         isStopping = true
+        for fileID in Array(pendingVoiceUploadURLs.keys) {
+            removePendingVoiceUpload(fileID: fileID)
+        }
         manager.closeClients()
         client = nil
         continuation.finish()
@@ -279,8 +280,50 @@ final class TDLibTelegramClient: TelegramClient {
         return await mapMessage(sent)
     }
 
-    func sendVoiceMessage(duration: TimeInterval, chatID: Int64) async throws -> Message {
-        throw TDLibTelegramClientError.unsupportedVoiceMessagePlaceholder
+    func sendVoiceMessage(fileURL: URL, duration: TimeInterval, chatID: Int64) async throws -> Message {
+        var uploadedFileID: Int?
+        do {
+            let uploadedFile: TDLibKit.File = try await runTDLibRequest { completion in
+                try tdClient.preliminaryUploadFile(
+                    file: .inputFileLocal(InputFileLocal(path: fileURL.path)),
+                    fileType: .fileTypeVoiceNote,
+                    priority: 32,
+                    completion: completion
+                )
+            }
+            uploadedFileID = uploadedFile.id
+            retainVoiceUpload(fileURL, for: uploadedFile.id)
+
+            let content = InputMessageContent.inputMessageVoiceNote(
+                InputMessageVoiceNote(
+                    caption: nil,
+                    duration: max(Int(duration.rounded(.up)), 1),
+                    selfDestructType: nil,
+                    voiceNote: .inputFileId(InputFileId(id: uploadedFile.id)),
+                    waveform: Data()
+                )
+            )
+
+            let sent: TDLibKit.Message = try await runTDLibRequest { completion in
+                try tdClient.sendMessage(
+                    chatId: chatID,
+                    inputMessageContent: content,
+                    options: nil,
+                    replyMarkup: nil,
+                    replyTo: nil,
+                    topicId: nil,
+                    completion: completion
+                )
+            }
+            return await mapMessage(sent)
+        } catch {
+            if let uploadedFileID {
+                removePendingVoiceUpload(fileID: uploadedFileID)
+            } else {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+            throw error
+        }
     }
 
     private var tdClient: TDLibClient {
@@ -362,9 +405,26 @@ final class TDLibTelegramClient: TelegramClient {
                 let message = await mapMessage(update.message)
                 continuation.yield(.messagesChanged(chatID: update.message.chatId, messages: [message]))
             }
+        case .updateFile(let update):
+            if update.file.remote.isUploadingCompleted {
+                removePendingVoiceUpload(fileID: update.file.id)
+            }
         default:
             break
         }
+    }
+
+    private func retainVoiceUpload(_ url: URL, for fileID: Int) {
+        pendingVoiceUploadURLs[fileID] = url
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(3600))
+            self?.removePendingVoiceUpload(fileID: fileID)
+        }
+    }
+
+    private func removePendingVoiceUpload(fileID: Int) {
+        guard let url = pendingVoiceUploadURLs.removeValue(forKey: fileID) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private func handleAuthorizationState(_ state: AuthorizationState) {

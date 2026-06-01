@@ -125,7 +125,8 @@ final class DummyTelegramClient: TelegramClient {
         return message
     }
 
-    func sendVoiceMessage(duration: TimeInterval, chatID: Int64) async throws -> Message {
+    func sendVoiceMessage(fileURL: URL, duration: TimeInterval, chatID: Int64) async throws -> Message {
+        try? FileManager.default.removeItem(at: fileURL)
         let message = Message(
             sender: "You",
             time: "Just now",

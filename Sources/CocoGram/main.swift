@@ -1150,8 +1150,8 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
 
     @objc private func recordMessage() {
         let controller = RecordingDialogController()
-        controller.onSend = { [weak self] duration in
-            self?.appendRecordedVoiceMessage(duration: duration)
+        controller.onSend = { [weak self] fileURL, duration in
+            self?.appendRecordedVoiceMessage(fileURL: fileURL, duration: duration)
         }
 
         let sheet = NSWindow(contentViewController: controller)
@@ -1166,15 +1166,23 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         }
     }
 
-    private func appendRecordedVoiceMessage(duration: TimeInterval) {
-        guard let chatID = currentConversationID else { return }
+    private func appendRecordedVoiceMessage(fileURL: URL, duration: TimeInterval) {
+        guard let chatID = currentConversationID else {
+            try? FileManager.default.removeItem(at: fileURL)
+            return
+        }
 
         Task { @MainActor [weak self] in
+            defer { try? FileManager.default.removeItem(at: fileURL) }
             guard let self else { return }
             let message: Message
             do {
-                message = try await telegramClient.sendVoiceMessage(duration: duration, chatID: chatID)
+                let encodedURL = try await Task.detached {
+                    try OggOpusEncoder.encode(fileURL)
+                }.value
+                message = try await telegramClient.sendVoiceMessage(fileURL: encodedURL, duration: duration, chatID: chatID)
             } catch {
+                announce("Couldn't send that voice message: \(error.localizedDescription)")
                 return
             }
 
@@ -1606,24 +1614,29 @@ final class AccountSetupController: NSViewController {
     }
 }
 
-final class RecordingDialogController: NSViewController {
+final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     enum RecordingState {
+        case preparing
         case recording
         case paused
         case stopped
         case playing
     }
 
-    var onSend: ((TimeInterval) -> Void)?
+    var onSend: ((URL, TimeInterval) -> Void)?
 
     private let statusLabel = NSTextField(labelWithString: "")
     private let elapsedLabel = NSTextField(labelWithString: "0:00")
     private let playPauseButton = NSButton(title: "Pause", target: nil, action: nil)
     private let stopButton = NSButton(title: "Stop", target: nil, action: nil)
     private let sendButton = NSButton(title: "Send", target: nil, action: nil)
-    private var state: RecordingState = .recording
-    private var elapsedSeconds: Int = 0
+    private var state: RecordingState = .preparing
     private var timer: Timer?
+    private var recorder: AVAudioRecorder?
+    private var previewPlayer: AVAudioPlayer?
+    private var recordingURL: URL?
+    private var recordedDuration: TimeInterval = 0
+    private var didTransferRecording = false
 
     override func loadView() {
         view = NSView()
@@ -1681,39 +1694,42 @@ final class RecordingDialogController: NSViewController {
             controls.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
 
-        updateState(.recording)
+        updateState(.preparing)
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        startTimer()
-        NSAccessibility.post(
-            element: statusLabel,
-            notification: .announcementRequested,
-            userInfo: [
-                .announcement: "Recording started",
-                .priority: NSAccessibilityPriorityLevel.high.rawValue
-            ]
-        )
+        Task { @MainActor [weak self] in
+            await self?.startRecordingWithPermission()
+        }
     }
 
     override func viewWillDisappear() {
         super.viewWillDisappear()
         timer?.invalidate()
+        finishRecording()
+        previewPlayer?.stop()
+        if !didTransferRecording, let recordingURL {
+            try? FileManager.default.removeItem(at: recordingURL)
+        }
     }
 
     @objc private func togglePlayPause() {
         switch state {
+        case .preparing:
+            return
         case .recording:
+            recorder?.pause()
             updateState(.paused)
             timer?.invalidate()
         case .paused:
+            recorder?.record()
             updateState(.recording)
             startTimer()
         case .stopped:
-            updateState(.playing)
-            startTimer()
+            playPreview()
         case .playing:
+            previewPlayer?.pause()
             updateState(.stopped)
             timer?.invalidate()
         }
@@ -1721,12 +1737,17 @@ final class RecordingDialogController: NSViewController {
 
     @objc private func stopRecording() {
         timer?.invalidate()
+        finishRecording()
         updateState(.stopped)
     }
 
     @objc private func sendRecording() {
         timer?.invalidate()
-        onSend?(TimeInterval(elapsedSeconds))
+        finishRecording()
+        previewPlayer?.stop()
+        guard let recordingURL, recordedDuration > 0 else { return }
+        didTransferRecording = true
+        onSend?(recordingURL, recordedDuration)
         closeSheet()
     }
 
@@ -1734,6 +1755,12 @@ final class RecordingDialogController: NSViewController {
         state = newState
 
         switch state {
+        case .preparing:
+            statusLabel.stringValue = "Preparing microphone"
+            playPauseButton.setAccessibilityLabel("Pause recording")
+            playPauseButton.isEnabled = false
+            stopButton.isEnabled = false
+            sendButton.isEnabled = false
         case .recording:
             statusLabel.stringValue = "Recording"
             playPauseButton.title = "Pause"
@@ -1773,14 +1800,112 @@ final class RecordingDialogController: NSViewController {
         timer = Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(tickElapsed), userInfo: nil, repeats: true)
     }
 
+    private func finishRecording() {
+        recordedDuration = max(recordedDuration, recorder?.currentTime ?? 0)
+        recorder?.stop()
+    }
+
     @objc private func tickElapsed() {
-        elapsedSeconds += 1
         updateElapsedLabel()
     }
 
     private func updateElapsedLabel() {
+        let elapsed = state == .playing ? previewPlayer?.currentTime ?? 0 : recorder?.currentTime ?? recordedDuration
+        let elapsedSeconds = Int(elapsed)
         elapsedLabel.stringValue = String(format: "%d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
         elapsedLabel.setAccessibilityLabel("Elapsed time \(Message.format(TimeInterval(elapsedSeconds)))")
+    }
+
+    private func startRecordingWithPermission() async {
+        let permissionGranted: Bool
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            permissionGranted = true
+        case .notDetermined:
+            permissionGranted = await AVCaptureDevice.requestAccess(for: .audio)
+        case .denied, .restricted:
+            permissionGranted = false
+        @unknown default:
+            permissionGranted = false
+        }
+
+        guard permissionGranted else {
+            showRecordingError("Microphone access is required to record a voice message.")
+            return
+        }
+
+        do {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("CocoGram-\(UUID().uuidString).caf")
+            let recorder = try AVAudioRecorder(
+                url: url,
+                settings: [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: 48_000,
+                    AVNumberOfChannelsKey: 2,
+                    AVLinearPCMBitDepthKey: 32,
+                    AVLinearPCMIsFloatKey: true,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false
+                ]
+            )
+            guard recorder.prepareToRecord(), recorder.record() else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+
+            recordingURL = url
+            self.recorder = recorder
+            updateState(.recording)
+            startTimer()
+            announce("Recording started")
+        } catch {
+            showRecordingError("Couldn't start recording: \(error.localizedDescription)")
+        }
+    }
+
+    private func playPreview() {
+        guard let recordingURL else { return }
+        do {
+            let player = try previewPlayer ?? AVAudioPlayer(contentsOf: recordingURL)
+            player.delegate = self
+            player.prepareToPlay()
+            previewPlayer = player
+            player.play()
+            updateState(.playing)
+            startTimer()
+        } catch {
+            showRecordingError("Couldn't play the recording preview: \(error.localizedDescription)")
+        }
+    }
+
+    private func showRecordingError(_ message: String) {
+        timer?.invalidate()
+        statusLabel.stringValue = message
+        statusLabel.setAccessibilityLabel(message)
+        playPauseButton.isEnabled = false
+        stopButton.isEnabled = false
+        sendButton.isEnabled = false
+        announce(message)
+    }
+
+    private func announce(_ message: String) {
+        NSAccessibility.post(
+            element: statusLabel,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue
+            ]
+        )
+    }
+
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            timer?.invalidate()
+            previewPlayer?.currentTime = 0
+            updateState(.stopped)
+        }
     }
 
     private func closeSheet() {

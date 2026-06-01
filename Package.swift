@@ -21,8 +21,16 @@ let package = Package(
             dependencies: [
                 .product(name: "TDLibKit", package: "TDLibKit"),
                 .product(name: "ogg", package: "ogg-binary-xcframework"),
-                .product(name: "opus", package: "opus-binary-xcframework")
+                .product(name: "opus", package: "opus-binary-xcframework"),
+                "OpusShim"
             ]
+        ),
+        .target(
+            name: "OpusShim",
+            dependencies: [
+                .product(name: "opus", package: "opus-binary-xcframework")
+            ],
+            publicHeadersPath: "include"
         )
     ]
 )
