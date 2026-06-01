@@ -136,6 +136,7 @@ final class TDLibTelegramClient: TelegramClient {
     private var chatCache: [Int64: TDLibKit.Chat] = [:]
     private var userCache: [Int64: TDLibKit.User] = [:]
     private var chatLastMessageCache: [Int64: TDLibKit.Message?] = [:]
+    private var isStopping = false
 
     init(configuration: TDLibConfiguration) {
         self.configuration = configuration
@@ -145,6 +146,7 @@ final class TDLibTelegramClient: TelegramClient {
     }
 
     func start() async throws {
+        guard !isStopping else { return }
         try prepareStorage()
         if client == nil {
             let updateBridge = updateBridge
@@ -152,6 +154,14 @@ final class TDLibTelegramClient: TelegramClient {
             configureTDLibLogging(for: newClient)
             client = newClient
         }
+    }
+
+    func stop() {
+        guard !isStopping else { return }
+        isStopping = true
+        manager.closeClients()
+        client = nil
+        continuation.finish()
     }
 
     func submitPhoneNumber(_ phoneNumber: String) async throws {

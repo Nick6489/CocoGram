@@ -84,6 +84,10 @@ final class DummyTelegramClient: TelegramClient {
         continuation.yield(.chatsChanged(conversations))
     }
 
+    func stop() {
+        continuation.finish()
+    }
+
     func submitPhoneNumber(_ phoneNumber: String) async throws {}
 
     func submitAuthenticationCode(_ code: String) async throws {}

@@ -26,6 +26,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        telegramClient?.stop()
+    }
+
     /// Builds the main window for the chosen client and starts the Telegram event loop.
     private func startSession(with client: TelegramClient) {
         telegramClient = client

@@ -22,6 +22,7 @@ protocol TelegramClient: AnyObject {
     var updates: AsyncStream<TelegramUpdate> { get }
 
     func start() async throws
+    func stop()
     func submitPhoneNumber(_ phoneNumber: String) async throws
     func submitAuthenticationCode(_ code: String) async throws
     func submitPassword(_ password: String) async throws
