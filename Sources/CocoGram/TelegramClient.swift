@@ -3,7 +3,16 @@ import Foundation
 enum TelegramUpdate {
     case authorizationStateChanged(TelegramAuthorizationState)
     case chatsChanged([Conversation])
+    /// Messages newly added to a chat (not the chat's full history).
     case messagesChanged(chatID: Int64, messages: [Message])
+    /// Startup hit a transient problem and the client is retrying. Not fatal: either
+    /// the retry succeeds and the normal flow continues, or `startupFailed` follows.
+    /// The message is suitable for an accessibility announcement.
+    case startupStalled(message: String)
+    /// The client could not finish its startup handshake (e.g. the TDLib database is
+    /// locked by another running copy of the app). The session is unusable until the
+    /// problem is resolved; the message is suitable for showing to the user.
+    case startupFailed(message: String)
 }
 
 enum TelegramAuthorizationState: Equatable {

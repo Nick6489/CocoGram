@@ -33,14 +33,83 @@ struct TDLibConfiguration {
             return nil
         }
 
-        let baseDirectory = appSupportDirectory().path
+        // The TDLib database holds the Telegram login session, and Telegram revokes a
+        // session whose api_id changes between connections. Because `.cocogram.local` is
+        // only found when launching from the project directory, a dev build and an
+        // installed build can resolve different credentials — so each credential set gets
+        // its own database, keyed by api_id (and DC), instead of sharing one directory.
+        let useTestDataCenter = values["COCOGRAM_TDLIB_TEST_DC"] == "1"
+        let storageSlot = "api-\(apiID)" + (useTestDataCenter ? "-test" : "")
+        if values["COCOGRAM_TDLIB_DATABASE"] == nil, !hasConflictingCredentialSources() {
+            migrateLegacySharedStorageIfNeeded(toSlot: storageSlot)
+        }
+
+        let slotDirectory = appSupportDirectory()
+            .appendingPathComponent("tdlib", isDirectory: true)
+            .appendingPathComponent(storageSlot, isDirectory: true)
         return TDLibConfiguration(
             apiID: apiID,
             apiHash: apiHash,
-            databaseDirectory: values["COCOGRAM_TDLIB_DATABASE"] ?? "\(baseDirectory)/tdlib/database",
-            filesDirectory: values["COCOGRAM_TDLIB_FILES"] ?? "\(baseDirectory)/tdlib/files",
-            useTestDataCenter: values["COCOGRAM_TDLIB_TEST_DC"] == "1"
+            databaseDirectory: values["COCOGRAM_TDLIB_DATABASE"] ?? slotDirectory.appendingPathComponent("database").path,
+            filesDirectory: values["COCOGRAM_TDLIB_FILES"] ?? slotDirectory.appendingPathComponent("files").path,
+            useTestDataCenter: useTestDataCenter
         )
+    }
+
+    /// The legacy shared database can't record which credentials own its session, so
+    /// adopting it is only safe when this launch sees a single api_id. When sources
+    /// disagree (a dev launch reading both `.cocogram.local` and saved credentials), the
+    /// migration is left to a launch context that sees only one — adopting under the
+    /// wrong api_id would get the session revoked, defeating the migration's purpose.
+    private static func hasConflictingCredentialSources() -> Bool {
+        let apiIDs = [savedConfiguration(), localConfiguration(), ProcessInfo.processInfo.environment]
+            .compactMap { $0["COCOGRAM_API_ID"] }
+        return Set(apiIDs).count > 1
+    }
+
+    /// Adopts a pre-existing shared `tdlib/database` (the layout before storage was keyed
+    /// per credential set) into the slot for the currently resolved credentials, so an
+    /// existing login survives the layout change where possible. Skipped when the slot
+    /// already exists or another running instance still holds the TDLib database lock.
+    private static func migrateLegacySharedStorageIfNeeded(toSlot slot: String) {
+        let fileManager = FileManager.default
+        let tdlibRoot = appSupportDirectory().appendingPathComponent("tdlib", isDirectory: true)
+        let legacyDatabase = tdlibRoot.appendingPathComponent("database", isDirectory: true)
+        let slotRoot = tdlibRoot.appendingPathComponent(slot, isDirectory: true)
+
+        guard
+            fileManager.fileExists(atPath: legacyDatabase.path),
+            !fileManager.fileExists(atPath: slotRoot.path),
+            !isBinlogLockedByRunningInstance(legacyDatabase.appendingPathComponent("td.binlog"))
+        else {
+            return
+        }
+
+        do {
+            try fileManager.createDirectory(at: slotRoot, withIntermediateDirectories: true)
+            try fileManager.moveItem(at: legacyDatabase, to: slotRoot.appendingPathComponent("database"))
+        } catch {
+            return
+        }
+
+        let legacyFiles = tdlibRoot.appendingPathComponent("files", isDirectory: true)
+        if fileManager.fileExists(atPath: legacyFiles.path) {
+            try? fileManager.moveItem(at: legacyFiles, to: slotRoot.appendingPathComponent("files"))
+        }
+    }
+
+    /// TDLib holds an exclusive `fcntl` write lock on `td.binlog` for the lifetime of the
+    /// process using it. Probing that lock tells us whether moving the directory would
+    /// yank the database out from under a still-running instance.
+    private static func isBinlogLockedByRunningInstance(_ binlogURL: URL) -> Bool {
+        let descriptor = open(binlogURL.path, O_RDWR)
+        guard descriptor >= 0 else { return false }
+        defer { close(descriptor) }
+
+        var lock = flock()
+        lock.l_type = Int16(F_WRLCK)
+        lock.l_whence = Int16(SEEK_SET)
+        return fcntl(descriptor, F_SETLK, &lock) == -1
     }
 
     /// True when usable credentials already exist anywhere — used to decide whether the
@@ -123,11 +192,29 @@ enum TDLibTelegramClientError: LocalizedError {
 }
 
 final class TDLibTelegramClient: TelegramClient {
+    /// All TDLib clients in the process must share one manager: every manager starts its
+    /// own thread looping the process-global `td_receive`, and TDLib aborts when two
+    /// threads call receive concurrently (and whichever loop wins would silently discard
+    /// the other manager's events). Created lazily so dummy-mode runs never start a
+    /// TDLib receive thread.
+    private static var _sharedManager: TDLibClientManager?
+    private static var sharedManager: TDLibClientManager {
+        if let manager = _sharedManager { return manager }
+        let manager = TDLibClientManager()
+        _sharedManager = manager
+        return manager
+    }
+
+    /// Blocks until every TDLib client has flushed its database and closed. Call only
+    /// from `applicationWillTerminate`; individual sessions end via `stop()`.
+    static func shutdownAllClients() {
+        _sharedManager?.closeClients()
+    }
+
     let updates: AsyncStream<TelegramUpdate>
 
     private let continuation: AsyncStream<TelegramUpdate>.Continuation
     private let configuration: TDLibConfiguration
-    private let manager = TDLibClientManager()
     private lazy var updateBridge = TDLibUpdateBridge(owner: self)
     private var client: TDLibClient?
     private var chatCache: [Int64: TDLibKit.Chat] = [:]
@@ -135,6 +222,8 @@ final class TDLibTelegramClient: TelegramClient {
     private var chatLastMessageCache: [Int64: TDLibKit.Message?] = [:]
     private var pendingVoiceUploadURLs: [Int: URL] = [:]
     private var isStopping = false
+    private var needsChatsRefresh = false
+    private var isChatsRefreshRunning = false
 
     init(configuration: TDLibConfiguration) {
         self.configuration = configuration
@@ -148,7 +237,7 @@ final class TDLibTelegramClient: TelegramClient {
         try prepareStorage()
         if client == nil {
             let updateBridge = updateBridge
-            let newClient = manager.createClient(updateHandler: updateBridge.handle(data:client:))
+            let newClient = Self.sharedManager.createClient(updateHandler: updateBridge.handle(data:client:))
             configureTDLibLogging(for: newClient)
             client = newClient
         }
@@ -160,7 +249,12 @@ final class TDLibTelegramClient: TelegramClient {
         for fileID in Array(pendingVoiceUploadURLs.keys) {
             removePendingVoiceUpload(fileID: fileID)
         }
-        manager.closeClients()
+        // Close only this instance's client — the shared manager may already be running
+        // a replacement session. The blocking flush-everything wait lives in
+        // `shutdownAllClients()` and happens once, at app termination.
+        if let client {
+            try? client.close(completion: { _ in })
+        }
         client = nil
         continuation.finish()
     }
@@ -346,9 +440,20 @@ final class TDLibTelegramClient: TelegramClient {
         )
     }
 
+    /// Keeps warnings and errors in a rotating file next to the database. The failures
+    /// behind a "logged in yesterday, asked for my phone number today" report happen
+    /// inside TDLib (revoked sessions, database lock contention) and are otherwise
+    /// invisible after the fact.
     private func configureTDLibLogging(for client: TDLibClient) {
-        try? client.setLogStream(logStream: .logStreamEmpty, completion: ignoreTDLibOKResult)
-        try? client.setLogVerbosityLevel(newVerbosityLevel: 1, completion: ignoreTDLibOKResult)
+        let logPath = URL(fileURLWithPath: configuration.databaseDirectory)
+            .deletingLastPathComponent()
+            .appendingPathComponent("tdlib.log")
+            .path
+        let stream = LogStream.logStreamFile(
+            LogStreamFile(maxFileSize: 5 * 1024 * 1024, path: logPath, redirectStderr: false)
+        )
+        try? client.setLogStream(logStream: stream, completion: ignoreTDLibOKResult)
+        try? client.setLogVerbosityLevel(newVerbosityLevel: 2, completion: ignoreTDLibOKResult)
     }
 
     private func loadLatestMessages(chatID: Int64) async throws -> Messages {
@@ -393,12 +498,7 @@ final class TDLibTelegramClient: TelegramClient {
             chatCache[update.chat.id] = update.chat
         case .updateChatLastMessage(let update):
             chatLastMessageCache[update.chatId] = update.lastMessage
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if let conversations = try? await fetchChats() {
-                    continuation.yield(.chatsChanged(conversations))
-                }
-            }
+            scheduleChatsRefresh()
         case .updateNewMessage(let update):
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -432,7 +532,7 @@ final class TDLibTelegramClient: TelegramClient {
         case .authorizationStateWaitTdlibParameters:
             continuation.yield(.authorizationStateChanged(.waitingForParameters))
             Task { @MainActor [weak self] in
-                try? await self?.sendTDLibParameters()
+                await self?.sendTDLibParametersReportingFailure()
             }
         case .authorizationStateWaitPhoneNumber:
             continuation.yield(.authorizationStateChanged(.waitingForPhoneNumber))
@@ -450,10 +550,101 @@ final class TDLibTelegramClient: TelegramClient {
             }
         case .authorizationStateLoggingOut:
             continuation.yield(.authorizationStateChanged(.loggingOut))
+        case .authorizationStateClosing:
+            // Transient while TDLib shuts down; `closed` follows and is what matters.
+            break
         case .authorizationStateClosed:
             continuation.yield(.authorizationStateChanged(.closed))
+            if !isStopping {
+                // TDLib closed itself (it does this after a server-side logout, having
+                // destroyed the database). The instance is dead: TDLibKit drops responses
+                // for closed clients, so any further request would hang its caller
+                // forever. Failing fast lets the owner build a fresh client and restart
+                // the sign-in flow.
+                client = nil
+                continuation.finish()
+            }
         default:
-            continuation.yield(.authorizationStateChanged(.unknown(String(describing: state))))
+            continuation.yield(.authorizationStateChanged(.unknown(humanReadableStateName(state))))
+        }
+    }
+
+    /// "authorizationStateWaitEmailCode(...)" reads as a code dump over VoiceOver;
+    /// reduce it to plain words ("wait email code").
+    private func humanReadableStateName(_ state: AuthorizationState) -> String {
+        let caseName = String(describing: state)
+            .prefix(while: { $0 != "(" })
+            .replacingOccurrences(of: "authorizationState", with: "")
+        var words = ""
+        for character in caseName {
+            if character.isUppercase, !words.isEmpty {
+                words.append(" ")
+            }
+            words.append(Character(character.lowercased()))
+        }
+        return words
+    }
+
+    /// `setTdlibParameters` failures would otherwise strand TDLib in
+    /// `waitTdlibParameters` with a normal-looking, permanently empty window. Lock
+    /// contention — a previous instance still holding the database while it finishes
+    /// quitting — is the one transient cause, so only it is retried (each attempt blocks
+    /// ~10s inside TDLib's own lock wait) and the user hears that a retry is underway.
+    /// Everything else is permanent and reported immediately.
+    private func sendTDLibParametersReportingFailure() async {
+        var lastError: Swift.Error?
+        for attempt in 1...3 {
+            guard !isStopping else { return }
+            do {
+                try await sendTDLibParameters()
+                return
+            } catch {
+                lastError = error
+                guard isDatabaseLockError(error) else { break }
+                if attempt == 1 {
+                    continuation.yield(.startupStalled(
+                        message: "Telegram's local database is in use — another copy of CocoGram may still be closing. Retrying."
+                    ))
+                }
+                if attempt < 3 {
+                    try? await Task.sleep(for: .seconds(2))
+                }
+            }
+        }
+
+        let description: String
+        if let tdError = lastError as? TDLibKit.Error {
+            description = tdError.message
+        } else {
+            description = lastError?.localizedDescription ?? "Unknown error"
+        }
+        continuation.yield(.startupFailed(message: description))
+    }
+
+    private func isDatabaseLockError(_ error: Swift.Error) -> Bool {
+        guard let tdError = error as? TDLibKit.Error else { return false }
+        return tdError.message.localizedCaseInsensitiveContains("lock")
+    }
+
+    private func scheduleChatsRefresh() {
+        // TDLib delivers updateChatLastMessage in bursts (several per chat during the
+        // initial sync). A single coalescing loop keeps at most one chat-list fetch in
+        // flight and always finishes on the newest state — per-update fetches would
+        // flood the main actor, and overlapping fetches can complete out of order,
+        // letting an older snapshot overwrite a newer one.
+        needsChatsRefresh = true
+        guard !isChatsRefreshRunning else { return }
+        isChatsRefreshRunning = true
+        Task { @MainActor [weak self] in
+            while true {
+                guard let self, !self.isStopping, self.needsChatsRefresh else { break }
+                self.needsChatsRefresh = false
+                try? await Task.sleep(for: .milliseconds(300))
+                if let conversations = try? await self.fetchChats() {
+                    self.continuation.yield(.chatsChanged(conversations))
+                }
+            }
+            self?.isChatsRefreshRunning = false
         }
     }
 

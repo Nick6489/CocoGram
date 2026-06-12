@@ -6,6 +6,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowController: MainWindowController?
     private var telegramClient: TelegramClient!
     private var setupWindow: NSWindow?
+    private var authSheet: NSWindow?
+    private var authSheetState: TelegramAuthorizationState?
+    private var lastAuthState: TelegramAuthorizationState?
+    private var isTerminating = false
+    private var sessionRestartTimestamps: [Date] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -27,22 +32,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        isTerminating = true
         telegramClient?.stop()
+        TDLibTelegramClient.shutdownAllClients()
     }
 
     /// Builds the main window for the chosen client and starts the Telegram event loop.
+    /// Also used to restart with a fresh client after TDLib closes itself (server-side
+    /// logout); the replacement window is shown before the old one closes so
+    /// `applicationShouldTerminateAfterLastWindowClosed` never sees zero windows.
     private func startSession(with client: TelegramClient) {
+        let previousWindowController = windowController
+        let previousAuthSheet = authSheet
+        authSheet = nil
+        authSheetState = nil
+        lastAuthState = nil
+
         telegramClient = client
         let controller = MainWindowController(telegramClient: client)
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         windowController = controller
+        if let previousAuthSheet, let previousWindow = previousWindowController?.window {
+            previousWindow.endSheet(previousAuthSheet)
+        }
+        previousWindowController?.close()
 
         Task {
-            try? await client.start()
+            do {
+                try await client.start()
+            } catch {
+                presentStartupFailure(error.localizedDescription)
+            }
         }
         Task {
-            await observeTelegramUpdates()
+            await observeTelegramUpdates(from: client)
         }
     }
 
@@ -140,6 +164,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let setup = appMenu.addItem(withTitle: "Set Up Telegram Account…", action: #selector(showAccountSetup), keyEquivalent: "")
         setup.target = self
         setup.setAccessibilityHelp("Enter or change your Telegram API credentials.")
+        let signIn = appMenu.addItem(withTitle: "Sign In to Telegram…", action: #selector(showSignInPrompt), keyEquivalent: "")
+        signIn.target = self
+        signIn.setAccessibilityHelp("Reopen the prompt for the current Telegram sign-in step, such as the phone number or login code.")
         appMenu.addItem(.separator())
         let hide = appMenu.addItem(withTitle: "Hide \(appName)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         hide.target = NSApp
@@ -212,23 +239,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowController?.increaseVoicePlaybackVolume()
     }
 
-    private func observeTelegramUpdates() async {
-        for await update in telegramClient.updates {
+    private func observeTelegramUpdates(from client: TelegramClient) async {
+        for await update in client.updates {
             switch update {
             case .authorizationStateChanged(let state):
                 handleAuthorizationState(state)
-            case .chatsChanged:
-                windowController?.showChats()
-            case .messagesChanged:
-                break
+            case .chatsChanged(let conversations):
+                windowController?.applyChats(conversations)
+            case .messagesChanged(let chatID, let messages):
+                windowController?.applyIncomingMessages(chatID: chatID, messages: messages)
+            case .startupStalled(let message):
+                announce(message)
+            case .startupFailed(let message):
+                presentStartupFailure(message)
             }
         }
     }
 
     private func handleAuthorizationState(_ state: TelegramAuthorizationState) {
+        lastAuthState = state
         switch state {
+        case .waitingForParameters:
+            break
         case .waitingForPhoneNumber:
             presentAuthenticationPrompt(
+                for: state,
                 title: "Telegram Phone Number",
                 message: "Enter your Telegram phone number in international format.",
                 placeholder: "+15551234567",
@@ -238,6 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case .waitingForCode:
             presentAuthenticationPrompt(
+                for: state,
                 title: "Telegram Code",
                 message: "Enter the login code Telegram sent you.",
                 placeholder: "Login code",
@@ -247,6 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         case .waitingForPassword:
             presentAuthenticationPrompt(
+                for: state,
                 title: "Telegram Password",
                 message: "Enter your two-step verification password.",
                 placeholder: "Password",
@@ -255,13 +292,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try await self?.telegramClient.submitPassword(value)
             }
         case .ready:
+            dismissAuthSheet()
+            sessionRestartTimestamps = []
             windowController?.showChats()
+        case .loggingOut:
+            dismissAuthSheet()
+            announce("Telegram is signing this device out. You will be asked to sign in again.")
+        case .closed:
+            dismissAuthSheet()
+            restartSessionAfterRemoteLogout()
+        case .unknown(let description):
+            announce("Telegram asked for a sign-in step CocoGram doesn't support yet: \(description)")
+        }
+    }
+
+    /// TDLib closes itself after a server-side logout (revoked session, terminated from
+    /// another device), having destroyed its local database. A closed client can never
+    /// recover, so unless the app is quitting, a fresh client is started — which lands in
+    /// the normal sign-in flow instead of leaving a working-looking but dead window.
+    private func restartSessionAfterRemoteLogout() {
+        guard !isTerminating else { return }
+        guard let configuration = TDLibConfiguration.resolve() else {
+            presentStartupFailure("Your Telegram session ended, and CocoGram's API credentials could not be found to sign in again. Choose Set Up Telegram Account from the CocoGram menu.")
+            return
+        }
+
+        let now = Date()
+        sessionRestartTimestamps = sessionRestartTimestamps.filter { now.timeIntervalSince($0) < 60 }
+        sessionRestartTimestamps.append(now)
+        guard sessionRestartTimestamps.count <= 2 else {
+            presentStartupFailure("Telegram keeps closing the session. Quit CocoGram and reopen it; if this continues, check ~/Library/Application Support/CocoGram/tdlib for details in tdlib.log.")
+            return
+        }
+
+        telegramClient?.stop()
+        startSession(with: TDLibTelegramClient(configuration: configuration))
+        announce("Your Telegram session ended. Please sign in again.")
+    }
+
+    /// Surfaces a fatal client-startup problem (database locked by another running copy,
+    /// unusable storage directory) that previously vanished into a silent, empty window.
+    private func presentStartupFailure(_ message: String) {
+        guard !isTerminating else { return }
+        announce("CocoGram couldn't connect to Telegram. \(message)")
+
+        let alert = NSAlert()
+        alert.messageText = "CocoGram couldn't connect to Telegram"
+        alert.informativeText = "\(message)\n\nIf another copy of CocoGram is running, quit it and reopen this one."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Quit CocoGram")
+        alert.addButton(withTitle: "Continue Anyway")
+
+        let respond: (NSApplication.ModalResponse) -> Void = { response in
+            if response == .alertFirstButtonReturn {
+                NSApp.terminate(nil)
+            }
+        }
+        if let window = windowController?.window {
+            alert.beginSheetModal(for: window, completionHandler: respond)
+        } else {
+            respond(alert.runModal())
+        }
+    }
+
+    /// Re-presents the prompt for the current sign-in step. Reachable from the app menu
+    /// so a dismissed sheet (close button or Cmd+W) is recoverable instead of leaving the
+    /// session stuck halfway through authentication.
+    @objc private func showSignInPrompt() {
+        switch lastAuthState {
+        case .waitingForPhoneNumber, .waitingForCode, .waitingForPassword:
+            handleAuthorizationState(lastAuthState!)
+        case .unknown(let description):
+            announce("Telegram is asking for a sign-in step CocoGram doesn't support yet: \(description). Try signing in from another Telegram app first.")
         default:
-            break
+            announce("Telegram is not asking for sign-in right now.")
         }
     }
 
     private func presentAuthenticationPrompt(
+        for state: TelegramAuthorizationState,
         title: String,
         message: String,
         placeholder: String,
@@ -269,7 +378,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         submit: @escaping (String) async throws -> Void
     ) {
         guard let parentWindow = windowController?.window else { return }
-        if parentWindow.attachedSheet != nil { return }
+        // The newest authorization state always wins: TDLib can emit the next state
+        // (e.g. waitCode) before the previous submission's response arrives, and a
+        // dropped prompt would strand the login with no way to continue.
+        if authSheet != nil, authSheetState == state { return }
+        dismissAuthSheet()
 
         let controller = AuthenticationPromptController(
             title: title,
@@ -277,23 +390,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             placeholder: placeholder,
             isSecure: isSecure
         )
-        controller.onSubmit = { value in
+        let sheet = NSWindow(contentViewController: controller)
+        controller.onSubmit = { [weak self, weak sheet] value in
             Task { @MainActor in
                 do {
                     try await submit(value)
-                    parentWindow.endSheet(controller.view.window!)
+                    // Dismiss only if this sheet is still the active prompt — the next
+                    // auth state may already have replaced it.
+                    if let self, let sheet, self.authSheet === sheet {
+                        self.dismissAuthSheet()
+                    }
                 } catch {
                     controller.showError(error.localizedDescription)
                 }
             }
         }
 
-        let sheet = NSWindow(contentViewController: controller)
         sheet.title = title
         sheet.styleMask = [.titled, .closable]
         sheet.setContentSize(NSSize(width: 430, height: 220))
         sheet.isReleasedWhenClosed = false
-        parentWindow.beginSheet(sheet)
+        authSheet = sheet
+        authSheetState = state
+        parentWindow.beginSheet(sheet) { [weak self] _ in
+            guard let self else { return }
+            // Still tracked here means the user closed the sheet themselves (close
+            // button or Cmd+W); programmatic dismissals clear the tracking first.
+            if self.authSheet === sheet {
+                self.authSheet = nil
+                self.authSheetState = nil
+                self.announce("Sign-in canceled. Choose Sign In to Telegram from the CocoGram menu to continue.")
+            }
+        }
+    }
+
+    private func dismissAuthSheet() {
+        guard let sheet = authSheet else { return }
+        authSheet = nil
+        authSheetState = nil
+        windowController?.window?.endSheet(sheet)
     }
 }
 
@@ -316,6 +451,14 @@ final class MainWindowController: NSWindowController {
 
     func showChats() {
         (contentViewController as? RootViewController)?.showChats()
+    }
+
+    func applyChats(_ conversations: [Conversation]) {
+        (contentViewController as? RootViewController)?.applyChats(conversations)
+    }
+
+    func applyIncomingMessages(chatID: Int64, messages: [Message]) {
+        (contentViewController as? RootViewController)?.applyIncomingMessages(chatID: chatID, messages: messages)
     }
 
     func decreaseVoicePlaybackSpeed() {
@@ -378,6 +521,14 @@ final class RootViewController: NSSplitViewController {
 
     func showChats() {
         sidebarController.select(section: .chats)
+    }
+
+    func applyChats(_ conversations: [Conversation]) {
+        listController.applyChats(conversations)
+    }
+
+    func applyIncomingMessages(chatID: Int64, messages: [Message]) {
+        detailController.applyIncomingMessages(chatID: chatID, messages: messages)
     }
 
     func decreaseVoicePlaybackSpeed() {
@@ -487,6 +638,7 @@ final class ItemListViewController: NSViewController, NSTableViewDataSource, NST
     private var items: [DetailItem] = []
     private var selectedItem: DetailItem?
     private var isSelectingProgrammatically = false
+    private var hasLoadedItemsOnce = false
 
     init(telegramClient: TelegramClient) {
         self.telegramClient = telegramClient
@@ -567,16 +719,69 @@ final class ItemListViewController: NSViewController, NSTableViewDataSource, NST
                 }
 
                 guard self.section == section else { return }
+                self.hasLoadedItemsOnce = true
                 self.items = loadedItems
                 self.tableView.reloadData()
                 if !loadedItems.isEmpty {
                     self.selectItem(at: self.initialSelectionIndex(in: loadedItems, for: section))
                 }
             } catch {
+                guard self.section == section else { return }
                 self.items = []
                 self.tableView.reloadData()
                 self.titleLabel.stringValue = "\(section.rawValue) unavailable"
+                // Only a regression from a previously working list is worth announcing.
+                // The first load on a live client predictably fails (it races client
+                // startup, before sign-in), and barking a false alarm at every launch
+                // would teach the user to ignore the announcement that matters.
+                if self.hasLoadedItemsOnce {
+                    NSAccessibility.post(
+                        element: self.view,
+                        notification: .announcementRequested,
+                        userInfo: [
+                            .announcement: "\(section.rawValue) could not be loaded. \(error.localizedDescription)",
+                            .priority: NSAccessibilityPriorityLevel.high.rawValue
+                        ]
+                    )
+                }
             }
+        }
+    }
+
+    /// Refreshes the chat list in place from a pushed update, preserving the current
+    /// selection. Unlike `show(section:)` this never clears the table first, so live
+    /// updates don't blank the list (and yank VoiceOver focus) while a reload runs.
+    func applyChats(_ conversations: [Conversation]) {
+        guard section == .chats else { return }
+        let newItems = conversations.map(DetailItem.conversation)
+        // Reloading rebuilds every row's accessibility element, which shoves the
+        // VoiceOver cursor off the list — never do it for a no-op refresh.
+        guard newItems != items else { return }
+        titleLabel.stringValue = section.rawValue
+        hasLoadedItemsOnce = true
+
+        let selectedConversationID: Int64?
+        if case .conversation(let conversation)? = selectedItem {
+            selectedConversationID = conversation.id
+        } else {
+            selectedConversationID = nil
+        }
+
+        let wasEmpty = items.isEmpty
+        items = newItems
+        tableView.reloadData()
+
+        if let selectedConversationID,
+           let row = items.firstIndex(where: { item in
+               guard case .conversation(let conversation) = item else { return false }
+               return conversation.id == selectedConversationID
+           }) {
+            selectedItem = items[row]
+            isSelectingProgrammatically = true
+            tableView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            isSelectingProgrammatically = false
+        } else if wasEmpty, !items.isEmpty {
+            selectItem(at: initialSelectionIndex(in: items, for: .chats))
         }
     }
 
@@ -927,6 +1132,16 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     private func reloadSelectedConversation() {
         guard let currentConversationID else { return }
         loadMessages(for: currentConversationID)
+    }
+
+    /// Appends messages pushed by a live update so the open conversation stays current.
+    /// Outgoing messages are skipped: the send path already appends them locally, and a
+    /// pushed copy can't be deduplicated (the Message model carries no id).
+    func applyIncomingMessages(chatID: Int64, messages newMessages: [Message]) {
+        guard currentConversationID == chatID else { return }
+        for message in newMessages where !message.isOutgoing {
+            appendMessageToTable(message)
+        }
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {

@@ -121,7 +121,7 @@ final class DummyTelegramClient: TelegramClient {
     func sendText(_ text: String, chatID: Int64) async throws -> Message {
         let message = Message(sender: "You", time: "Just now", isOutgoing: true, kind: .text(text), outgoingStatus: .sent)
         messagesByChatID[chatID, default: []].append(message)
-        continuation.yield(.messagesChanged(chatID: chatID, messages: messagesByChatID[chatID, default: []]))
+        continuation.yield(.messagesChanged(chatID: chatID, messages: [message]))
         return message
     }
 
@@ -135,7 +135,7 @@ final class DummyTelegramClient: TelegramClient {
             outgoingStatus: .sent
         )
         messagesByChatID[chatID, default: []].append(message)
-        continuation.yield(.messagesChanged(chatID: chatID, messages: messagesByChatID[chatID, default: []]))
+        continuation.yield(.messagesChanged(chatID: chatID, messages: [message]))
         return message
     }
 }

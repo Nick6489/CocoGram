@@ -35,6 +35,14 @@ COCOGRAM_TDLIB_FILES=<path>     # optional: override TDLib files directory
 
 Without valid credentials the app starts in **dummy mode** (`DummyTelegramClient`), which shows hardcoded sample data and is the default development path.
 
+**TDLib storage is keyed per credential set**: the database and files live in
+`~/Library/Application Support/CocoGram/tdlib/api-<api_id>[-test]/`. This matters because
+`.cocogram.local` is read from the process working directory — a dev `swift run` and an
+installed app launched from Finder can resolve *different* api_id values, and reusing one
+TDLib database across api_ids gets the Telegram session revoked server-side (which is a
+full phone+OTP re-login). Each credential set therefore keeps its own session. A TDLib
+log (warnings and errors) is written to `tdlib.log` next to each database directory.
+
 ## Architecture
 
 ### TelegramClient protocol (`TelegramClient.swift`)

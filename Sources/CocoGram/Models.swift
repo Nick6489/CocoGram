@@ -67,7 +67,7 @@ struct Message {
     }
 }
 
-struct Conversation {
+struct Conversation: Equatable {
     let id: Int64
     let title: String
     let subtitle: String
@@ -77,26 +77,26 @@ struct Conversation {
     let isMuted: Bool
 }
 
-struct Contact {
+struct Contact: Equatable {
     let name: String
     let status: String
     let handle: String
 }
 
-struct Channel {
+struct Channel: Equatable {
     let title: String
     let members: String
     let preview: String
 }
 
-struct CallRecord {
+struct CallRecord: Equatable {
     let name: String
     let status: String
     let time: String
     let missed: Bool
 }
 
-enum DetailItem {
+enum DetailItem: Equatable {
     case conversation(Conversation)
     case contact(Contact)
     case channel(Channel)
