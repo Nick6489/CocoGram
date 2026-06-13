@@ -33,6 +33,15 @@ enum OggOpusEncoder {
             ])
         }
 
+        // Opus is always 48 kHz, so a non-48 kHz recording must be resampled here — but
+        // only here, and only when needed (the converter is a passthrough when the source
+        // is already 48 kHz). Use mastering-grade conversion for an audiophile-quality
+        // result on the rates real interfaces use (44.1/88.2/96/192 kHz, etc.).
+        if inputFormat.sampleRate != sampleRate {
+            converter.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Mastering
+            converter.sampleRateConverterQuality = .max
+        }
+
         // The converter can emit more frames than it consumes when upsampling (e.g.
         // 44.1 kHz → 48 kHz), so the output buffer is sized to the resample ratio plus
         // slack for the resampler's internal latency.

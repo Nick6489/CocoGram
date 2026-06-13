@@ -6,6 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowController: MainWindowController?
     private var telegramClient: TelegramClient!
     private var setupWindow: NSWindow?
+    private var settingsWindow: NSWindow?
+    private var settingsCloseObserver: NSObjectProtocol?
     private var authSheet: NSWindow?
     private var authSheetState: TelegramAuthorizationState?
     private var lastAuthState: TelegramAuthorizationState?
@@ -75,6 +77,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// exists); revisiting from the menu just saves and asks the user to relaunch.
     @objc func showAccountSetup() {
         presentAccountSetup()
+    }
+
+    /// Opens (or re-focuses) the Settings window. Standard macOS Settings — currently the
+    /// microphone-input picker for voice messages.
+    @objc func showSettings() {
+        if let settingsWindow {
+            settingsWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let controller = SettingsViewController()
+        let window = NSWindow(contentViewController: controller)
+        window.title = "CocoGram Settings"
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.isReleasedWhenClosed = false
+        window.center()
+        settingsWindow = window
+
+        // Track close so the next Cmd+, builds a fresh controller with a current device
+        // list. The notification is delivered on the main queue, so it is safe to touch
+        // main-actor state via assumeIsolated. The token lives in a property and is removed
+        // on close so observers don't accumulate across repeated opens.
+        if let existing = settingsCloseObserver {
+            NotificationCenter.default.removeObserver(existing)
+        }
+        settingsCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.settingsWindow = nil
+                if let observer = self.settingsCloseObserver {
+                    NotificationCenter.default.removeObserver(observer)
+                    self.settingsCloseObserver = nil
+                }
+            }
+        }
+
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func presentAccountSetup() {
@@ -160,6 +205,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
         appMenu.addItem(withTitle: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        // Standard macOS Settings item (Cmd+,). Hosts microphone-input selection.
+        let settings = appMenu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        settings.target = self
+        settings.setAccessibilityHelp("Choose which microphone records voice messages.")
         appMenu.addItem(.separator())
         let setup = appMenu.addItem(withTitle: "Set Up Telegram Account…", action: #selector(showAccountSetup), keyEquivalent: "")
         setup.target = self
@@ -1134,11 +1184,10 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         loadMessages(for: currentConversationID)
     }
 
-    /// Handles messages pushed by a live update. Plays a receive cue — "Same Window" when
-    /// the message is for the open chat (and appends it), "Push" otherwise — and only for
-    /// incoming messages. Outgoing messages are skipped: the send path already appends them
-    /// locally and plays the send cue, and a pushed copy can't be deduplicated (the Message
-    /// model carries no id).
+    /// Appends messages pushed by a live update so the open conversation stays current, and
+    /// plays the receive cue (same-window vs push depending on whether the message is for the
+    /// open chat). Outgoing messages are skipped: the send path already appends them locally
+    /// and plays the send cue, and a pushed copy can't be deduplicated (no message id).
     func applyIncomingMessages(chatID: Int64, messages newMessages: [Message]) {
         let incoming = newMessages.filter { !$0.isOutgoing }
         guard !incoming.isEmpty else { return }
@@ -1839,6 +1888,133 @@ final class AccountSetupController: NSViewController {
     }
 }
 
+/// Settings window. Currently hosts microphone-input selection for voice messages, built
+/// in code with the same accessibility contract as the rest of the app: the popup is
+/// labeled, the field order reads top-to-bottom under VoiceOver, and the chosen device is
+/// announced at high priority.
+final class SettingsViewController: NSViewController {
+    private let microphonePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let statusLabel = NSTextField(wrappingLabelWithString: "")
+    private var devices: [AudioInputDevice] = []
+
+    override func loadView() {
+        view = NSView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+
+        let titleLabel = NSTextField(labelWithString: "Settings")
+        titleLabel.font = .systemFont(ofSize: 22, weight: .semibold)
+        titleLabel.setAccessibilityRole(.staticText)
+        titleLabel.setAccessibilityLabel("Settings")
+
+        let sectionLabel = NSTextField(labelWithString: "Microphone")
+        sectionLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        sectionLabel.setAccessibilityRole(.staticText)
+
+        let helpLabel = NSTextField(wrappingLabelWithString: "Choose which microphone records voice messages. This applies only to CocoGram — it doesn’t change your Mac’s sound input — and recording always uses the device’s own sample rate.")
+        helpLabel.font = .systemFont(ofSize: 12)
+        helpLabel.textColor = .secondaryLabelColor
+        helpLabel.setAccessibilityLabel(helpLabel.stringValue)
+
+        let caption = NSTextField(labelWithString: "Input device")
+        caption.font = .systemFont(ofSize: 12, weight: .semibold)
+        caption.textColor = .secondaryLabelColor
+        caption.setAccessibilityElement(false)
+
+        microphonePopup.target = self
+        microphonePopup.action = #selector(microphoneChanged)
+        microphonePopup.setAccessibilityLabel("Microphone input device")
+        microphonePopup.setAccessibilityHelp("Choose which microphone records voice messages.")
+
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.setAccessibilityRole(.staticText)
+
+        let stack = NSStackView(views: [titleLabel, sectionLabel, helpLabel, caption, microphonePopup, statusLabel])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.edgeInsets = NSEdgeInsets(top: 24, left: 26, bottom: 24, right: 26)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setCustomSpacing(18, after: titleLabel)
+        stack.setCustomSpacing(16, after: helpLabel)
+        view.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: view.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            titleLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            helpLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            microphonePopup.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+
+        view.setFrameSize(NSSize(width: 460, height: 260))
+        reloadDevices()
+    }
+
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        view.window?.makeFirstResponder(microphonePopup)
+    }
+
+    private func reloadDevices() {
+        devices = VoiceMessageRecorder.availableInputDevices()
+
+        // Build menu items by hand (not addItem(withTitle:), which silently drops items
+        // whose title duplicates an existing one — common with two similar interfaces).
+        // Item 0 is "System Default"; items 1… map to `devices`.
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "System Default", action: nil, keyEquivalent: ""))
+        for device in devices {
+            menu.addItem(NSMenuItem(title: device.name, action: nil, keyEquivalent: ""))
+        }
+        microphonePopup.menu = menu
+
+        // Reflect the user's saved choice (a per-app preference; the system input is never
+        // changed). Falls back to System Default if the saved device isn't connected.
+        if let uid = AudioInputPreference.preferredUID, let index = devices.firstIndex(where: { $0.uid == uid }) {
+            microphonePopup.selectItem(at: index + 1)
+        } else {
+            microphonePopup.selectItem(at: 0)
+        }
+        updateStatus()
+    }
+
+    @objc private func microphoneChanged() {
+        let index = microphonePopup.indexOfSelectedItem
+        // Item 0 = System Default (clear the preference); items 1… select a specific device
+        // by stable UID. This only records the preference — it never opens the device and
+        // never changes the macOS system input, so unselected devices are left untouched.
+        if index <= 0 {
+            AudioInputPreference.preferredUID = nil
+        } else if index - 1 < devices.count {
+            AudioInputPreference.preferredUID = devices[index - 1].uid
+        }
+        updateStatus(announce: true)
+    }
+
+    private func updateStatus(announce: Bool = false) {
+        let name = microphonePopup.titleOfSelectedItem ?? "System Default"
+        let message = "Voice messages record from: \(name)."
+        statusLabel.stringValue = message
+        statusLabel.setAccessibilityLabel(message)
+        if announce {
+            NSAccessibility.post(
+                element: statusLabel,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: message,
+                    .priority: NSAccessibilityPriorityLevel.high.rawValue
+                ]
+            )
+        }
+    }
+}
+
 final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     enum RecordingState {
         case preparing
@@ -2146,8 +2322,9 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         do {
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent("CocoGram-\(UUID().uuidString).caf")
-            // Records at the input device's native rate/channels; the send path resamples
-            // to 48 kHz stereo once, in OggOpusEncoder. See VoiceMessageRecorder.
+            // Records from the current system input device (chosen in Settings ▸ Microphone)
+            // at its native rate/channels; the send path resamples to 48 kHz once, in
+            // OggOpusEncoder, and only when the native rate isn't already 48 kHz.
             let recorder = try VoiceMessageRecorder(url: url)
             recordingURL = url
             self.recorder = recorder
@@ -2571,6 +2748,9 @@ final class InfoPanelView: NSView {
         ])
     }
 }
+
+// Headless device-enumeration diagnostics (no GUI, no app.run(), opens no audio device).
+SelfTest.runIfRequested()
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

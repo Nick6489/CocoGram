@@ -73,16 +73,6 @@ login. This is what guarantees a logged-in user is never forced to re-authentica
 log (warnings and errors) is written to `tdlib.log` next to the database directory.
 **Per-api_id storage slots are forbidden** — they caused a re-auth regression once.
 
-### Sound effects (`SoundEffects.swift`)
-
-Short UI cues (recording Start/Pause/Stop, Send, Receive Same-Window/Push) live in
-`Sources/CocoGram/Sounds/*.m4a`, declared as an SPM `.copy("Sounds")` resource so
-`swift run` finds them via `Bundle.module`. `scripts/package.sh` copies them into the
-bundle's `Resources/Sounds` **before** code signing (so they're sealed and survive
-notarization), and the app loads them via `Bundle.main`. Cues are **additive** — they never
-replace VoiceOver announcements; recording cues are sequenced around capture so they aren't
-recorded into the message.
-
 ## Architecture
 
 ### TelegramClient protocol (`TelegramClient.swift`)

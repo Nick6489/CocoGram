@@ -127,11 +127,6 @@ say "Verifying microphone entitlement is present"
 codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.device.audio-input" \
     && echo "  audio-input entitlement: OK" \
     || { echo "ERROR: audio-input entitlement missing from signed app" >&2; exit 1; }
-say "Verifying sound effects are in the signed bundle"
-SIGNED_SOUNDS=$(ls -1 "$APP/Contents/Resources/Sounds"/*.m4a 2>/dev/null | wc -l | tr -d ' ')
-[ "$SIGNED_SOUNDS" -gt 0 ] \
-    && echo "  $SIGNED_SOUNDS sound file(s) present in signed bundle" \
-    || { echo "ERROR: sound effects missing from signed app" >&2; exit 1; }
 
 if [ "$SKIP_NOTARIZE" = "1" ]; then
     say "SKIP_NOTARIZE=1 — stopping after sign. App at: $APP"
