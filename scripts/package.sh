@@ -91,17 +91,27 @@ iconutil -c icns "$ICONSET" -o "$RES_DIR/AppIcon.icns"
 rm -rf "$ICONSET"
 
 # ---- 5. Code signing (hardened runtime, required for notarization) -----------------
+# The app gets the audio-input entitlement; the hardened runtime blocks the microphone
+# without it even though Info.plist declares NSMicrophoneUsageDescription. Frameworks are
+# signed without entitlements (they don't request resources).
+ENTITLEMENTS="$ROOT/CocoGram.entitlements"
+[ -f "$ENTITLEMENTS" ] || { echo "ERROR: entitlements not found at $ENTITLEMENTS" >&2; exit 1; }
 say "Code signing with: $SIGN_IDENTITY"
 codesign --force --options runtime --timestamp \
     --sign "$SIGN_IDENTITY" "$FRAMEWORKS_DIR/ogg.framework"
 codesign --force --options runtime --timestamp \
     --sign "$SIGN_IDENTITY" "$FRAMEWORKS_DIR/opus.framework"
 codesign --force --options runtime --timestamp \
+    --entitlements "$ENTITLEMENTS" \
     --sign "$SIGN_IDENTITY" "$APP"
 
 say "Verifying signature"
 codesign --verify --strict --verbose=2 "$APP"
 codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "Identifier|TeamIdentifier|Authority=Developer ID|flags" || true
+say "Verifying microphone entitlement is present"
+codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.device.audio-input" \
+    && echo "  audio-input entitlement: OK" \
+    || { echo "ERROR: audio-input entitlement missing from signed app" >&2; exit 1; }
 
 if [ "$SKIP_NOTARIZE" = "1" ]; then
     say "SKIP_NOTARIZE=1 — stopping after sign. App at: $APP"

@@ -23,6 +23,20 @@ let package = Package(
                 .product(name: "ogg", package: "ogg-binary-xcframework"),
                 .product(name: "opus", package: "opus-binary-xcframework"),
                 "OpusShim"
+            ],
+            // Info.plist is consumed by the linker (below), not bundled as a resource.
+            exclude: ["Info.plist"],
+            // Embed Info.plist into the binary's __TEXT,__info_plist section so the
+            // un-bundled `swift run` build carries NSMicrophoneUsageDescription — without
+            // it, macOS TCC never shows the microphone prompt during development. The
+            // path is relative to the package root, where the linker is invoked.
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/CocoGram/Info.plist"
+                ])
             ]
         ),
         .target(

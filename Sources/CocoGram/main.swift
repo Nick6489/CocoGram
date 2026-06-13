@@ -1849,10 +1849,11 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
     private var state: RecordingState = .preparing
     private var timer: Timer?
-    private var recorder: AVAudioRecorder?
+    private var recorder: VoiceMessageRecorder?
     private var previewPlayer: AVAudioPlayer?
     private var recordingURL: URL?
     private var recordedDuration: TimeInterval = 0
+    private var captureFailure: Error?
     private var didTransferRecording = false
     private var isClosing = false
 
@@ -1949,9 +1950,13 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             updateState(.recordingPaused)
             timer?.invalidate()
         case .recordingPaused:
-            recorder?.record()
-            updateState(.recording)
-            startTimer()
+            do {
+                try recorder?.resume()
+                updateState(.recording)
+                startTimer()
+            } catch {
+                showRecordingError("Couldn't resume recording: \(error.localizedDescription)")
+            }
         case .previewReady:
             playPreview(restarting: true)
         case .previewPlaying:
@@ -1966,6 +1971,12 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     @objc private func stopRecording() {
         timer?.invalidate()
         finishRecording()
+        // A write/device failure caught at Stop must be announced here — .previewReady is
+        // silent and would enable Send on a corrupt take with no signal to VoiceOver.
+        if let captureFailure {
+            showRecordingError("The recording couldn't be saved: \(captureFailure.localizedDescription)")
+            return
+        }
         updateState(.previewReady)
     }
 
@@ -1973,7 +1984,14 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         timer?.invalidate()
         finishRecording()
         previewPlayer?.stop()
-        guard let recordingURL, recordedDuration > 0 else { return }
+        if let captureFailure {
+            showRecordingError("The recording couldn't be saved: \(captureFailure.localizedDescription)")
+            return
+        }
+        guard let recordingURL, recordedDuration > 0 else {
+            announce("Nothing has been recorded yet. Press Record to start.")
+            return
+        }
         didTransferRecording = true
         onSend?(recordingURL, recordedDuration)
         closeSheet()
@@ -2045,12 +2063,27 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     }
 
     private func finishRecording() {
-        recordedDuration = max(recordedDuration, recorder?.currentTime ?? 0)
-        recorder?.stop()
+        if let recorder {
+            recorder.stop()
+            // Read after stop() so frames from the final in-flight tap buffers count.
+            recordedDuration = max(recordedDuration, recorder.currentTime)
+            if let error = recorder.captureError {
+                captureFailure = error
+            }
+        }
         recorder = nil
     }
 
     @objc private func tickElapsed() {
+        // Surface a mid-recording capture failure (device change, disk/write error) within
+        // a second instead of waiting for Send. The recorder's tap can't speak to the user
+        // itself, so the timer is the polling point.
+        if state == .recording, let error = recorder?.captureError {
+            timer?.invalidate()
+            finishRecording()
+            showRecordingError("Recording stopped: \(error.localizedDescription)")
+            return
+        }
         updateElapsedLabel()
     }
 
@@ -2093,21 +2126,10 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         do {
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent("CocoGram-\(UUID().uuidString).caf")
-            let recorder = try AVAudioRecorder(
-                url: url,
-                settings: [
-                    AVFormatIDKey: kAudioFormatLinearPCM,
-                    AVSampleRateKey: 48_000,
-                    AVNumberOfChannelsKey: 2,
-                    AVLinearPCMBitDepthKey: 32,
-                    AVLinearPCMIsFloatKey: true,
-                    AVLinearPCMIsBigEndianKey: false,
-                    AVLinearPCMIsNonInterleaved: false
-                ]
-            )
-            guard recorder.prepareToRecord(), recorder.record() else {
-                throw CocoaError(.fileWriteUnknown)
-            }
+            // Records at the input device's native rate/channels; the send path resamples
+            // to 48 kHz stereo once, in OggOpusEncoder. See VoiceMessageRecorder.
+            let recorder = try VoiceMessageRecorder(url: url)
+            try recorder.start()
 
             recordingURL = url
             self.recorder = recorder

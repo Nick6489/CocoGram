@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⛔ CRITICAL INVARIANT — read before touching auth/storage/signing
+
+**CocoGram must NEVER force a logged-in user to re-authenticate** (phone + OTP). Before
+changing anything under `TDLibConfiguration`, the TDLib database/files paths, credential
+resolution, auth-state handling, or `scripts/package.sh` signing, **read
+[`SESSION_PERSISTENCE_INVARIANT.md`](SESSION_PERSISTENCE_INVARIANT.md) in full and run its
+verification checklist.** The two non-negotiable rules: (A) the TDLib database directory is a
+fixed constant — never keyed on `api_id`, cwd, env, or which binary runs; (B) the
+`api_id`/`api_hash` are pinned into the database on first login and reused forever. Per-`api_id`
+storage slots are **forbidden** — they caused this exact regression once already.
+
 ## What this is
 
 CocoGram is a native macOS Telegram client built with AppKit and Swift Package Manager, targeting macOS 15. It wraps Telegram's TDLib via the [TDLibKit](https://github.com/Swiftgram/TDLibKit) Swift package.
@@ -34,6 +45,23 @@ COCOGRAM_TDLIB_FILES=<path>     # optional: override TDLib files directory
 ```
 
 Without valid credentials the app starts in **dummy mode** (`DummyTelegramClient`), which shows hardcoded sample data and is the default development path.
+
+### Microphone permission (voice messages)
+
+Recording requires macOS microphone access. Two pieces make the prompt appear:
+- `NSMicrophoneUsageDescription` — declared in both `Sources/CocoGram/Info.plist` (embedded
+  into the binary's `__TEXT,__info_plist` section by `Package.swift` linker flags, so the
+  un-bundled `swift run` build can prompt) and the bundle `Info.plist` written by
+  `scripts/package.sh`. Keep the string in sync across both.
+- `com.apple.security.device.audio-input` — in `CocoGram.entitlements`, applied to the
+  signed app by `package.sh`. **Required under the hardened runtime**: the notarized app is
+  denied the mic without it even though the usage string is present.
+
+Dev caveat: the `swift run` binary is ad-hoc signed, and its TCC identity (CDHash) changes
+whenever the executable is relinked, so a granted permission may not persist across rebuilds.
+The first run prompts; if a later build stops recording, reset with
+`tccutil reset Microphone me.giannak.nick.cocogram`, or test mic flows against the signed
+bundle (`scripts/package.sh` with `SKIP_NOTARIZE=1`), which has a stable identity.
 
 **TDLib storage is keyed per credential set**: the database and files live in
 `~/Library/Application Support/CocoGram/tdlib/api-<api_id>[-test]/`. This matters because

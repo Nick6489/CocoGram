@@ -15,15 +15,41 @@ struct TDLibConfiguration {
     let filesDirectory: String
     let useTestDataCenter: Bool
 
-    /// Resolves credentials from, in order of precedence (highest first): environment
-    /// variables, `.cocogram.local` in the working directory (developer workflows), then
-    /// credentials saved in Application Support by the in-app setup screen (end users).
-    /// Returns nil when no API credentials are available from any source.
+    /// Filename of the per-session credential pin, stored inside the database directory.
+    private static let pinFileName = "session.pin"
+
+    /// Resolves the TDLib configuration.
+    ///
+    /// INVARIANT (see `SESSION_PERSISTENCE_INVARIANT.md`): a logged-in user must never be
+    /// forced to re-authenticate. Two rules enforce that here:
+    ///  - RULE A — the database path is FIXED. It never depends on api_id, the test-DC flag,
+    ///    the working directory, the environment, or which binary is running. Every launch of
+    ///    every build resolves the same directory, so the session is never abandoned.
+    ///  - RULE B — once a session exists, the credentials PINNED into its database directory
+    ///    are authoritative. Launch-time config (`.cocogram.local`, `credentials.conf`, env)
+    ///    is consulted ONLY to bootstrap the very first login. Reusing the exact api_id the
+    ///    session was created with is what stops Telegram from revoking it.
     static func resolve() -> TDLibConfiguration? {
         var values = savedConfiguration()
         values.merge(localConfiguration()) { _, new in new }
         values.merge(ProcessInfo.processInfo.environment) { _, new in new }
 
+        // RULE A: fixed path. The only permitted variation is an explicit dev override.
+        let databaseDirectory = values["COCOGRAM_TDLIB_DATABASE"] ?? defaultDatabaseDirectory()
+        let filesDirectory = values["COCOGRAM_TDLIB_FILES"] ?? defaultFilesDirectory()
+
+        // RULE B: a pinned session's credentials win, unconditionally.
+        if let pinned = readPinnedCredentials(inDatabaseDirectory: databaseDirectory) {
+            return TDLibConfiguration(
+                apiID: pinned.apiID,
+                apiHash: pinned.apiHash,
+                databaseDirectory: databaseDirectory,
+                filesDirectory: filesDirectory,
+                useTestDataCenter: pinned.useTestDataCenter
+            )
+        }
+
+        // First login only: bootstrap credentials from config sources.
         guard
             let apiIDString = values["COCOGRAM_API_ID"],
             let apiID = Int(apiIDString),
@@ -33,83 +59,75 @@ struct TDLibConfiguration {
             return nil
         }
 
-        // The TDLib database holds the Telegram login session, and Telegram revokes a
-        // session whose api_id changes between connections. Because `.cocogram.local` is
-        // only found when launching from the project directory, a dev build and an
-        // installed build can resolve different credentials — so each credential set gets
-        // its own database, keyed by api_id (and DC), instead of sharing one directory.
-        let useTestDataCenter = values["COCOGRAM_TDLIB_TEST_DC"] == "1"
-        let storageSlot = "api-\(apiID)" + (useTestDataCenter ? "-test" : "")
-        if values["COCOGRAM_TDLIB_DATABASE"] == nil, !hasConflictingCredentialSources() {
-            migrateLegacySharedStorageIfNeeded(toSlot: storageSlot)
-        }
-
-        let slotDirectory = appSupportDirectory()
-            .appendingPathComponent("tdlib", isDirectory: true)
-            .appendingPathComponent(storageSlot, isDirectory: true)
         return TDLibConfiguration(
             apiID: apiID,
             apiHash: apiHash,
-            databaseDirectory: values["COCOGRAM_TDLIB_DATABASE"] ?? slotDirectory.appendingPathComponent("database").path,
-            filesDirectory: values["COCOGRAM_TDLIB_FILES"] ?? slotDirectory.appendingPathComponent("files").path,
-            useTestDataCenter: useTestDataCenter
+            databaseDirectory: databaseDirectory,
+            filesDirectory: filesDirectory,
+            useTestDataCenter: values["COCOGRAM_TDLIB_TEST_DC"] == "1"
         )
     }
 
-    /// The legacy shared database can't record which credentials own its session, so
-    /// adopting it is only safe when this launch sees a single api_id. When sources
-    /// disagree (a dev launch reading both `.cocogram.local` and saved credentials), the
-    /// migration is left to a launch context that sees only one — adopting under the
-    /// wrong api_id would get the session revoked, defeating the migration's purpose.
-    private static func hasConflictingCredentialSources() -> Bool {
-        let apiIDs = [savedConfiguration(), localConfiguration(), ProcessInfo.processInfo.environment]
-            .compactMap { $0["COCOGRAM_API_ID"] }
-        return Set(apiIDs).count > 1
+    /// The fixed, launch-invariant TDLib database directory. Never keyed on api_id, cwd, or
+    /// environment — see `SESSION_PERSISTENCE_INVARIANT.md` (RULE A).
+    private static func defaultDatabaseDirectory() -> String {
+        appSupportDirectory()
+            .appendingPathComponent("tdlib", isDirectory: true)
+            .appendingPathComponent("database", isDirectory: true).path
     }
 
-    /// Adopts a pre-existing shared `tdlib/database` (the layout before storage was keyed
-    /// per credential set) into the slot for the currently resolved credentials, so an
-    /// existing login survives the layout change where possible. Skipped when the slot
-    /// already exists or another running instance still holds the TDLib database lock.
-    private static func migrateLegacySharedStorageIfNeeded(toSlot slot: String) {
-        let fileManager = FileManager.default
-        let tdlibRoot = appSupportDirectory().appendingPathComponent("tdlib", isDirectory: true)
-        let legacyDatabase = tdlibRoot.appendingPathComponent("database", isDirectory: true)
-        let slotRoot = tdlibRoot.appendingPathComponent(slot, isDirectory: true)
+    private static func defaultFilesDirectory() -> String {
+        appSupportDirectory()
+            .appendingPathComponent("tdlib", isDirectory: true)
+            .appendingPathComponent("files", isDirectory: true).path
+    }
 
+    private static func pinURL(inDatabaseDirectory databaseDirectory: String) -> URL {
+        URL(fileURLWithPath: databaseDirectory).appendingPathComponent(pinFileName)
+    }
+
+    private static func readPinnedCredentials(inDatabaseDirectory databaseDirectory: String)
+        -> (apiID: Int, apiHash: String, useTestDataCenter: Bool)? {
+        let values = parseKeyValueFile(at: pinURL(inDatabaseDirectory: databaseDirectory))
         guard
-            fileManager.fileExists(atPath: legacyDatabase.path),
-            !fileManager.fileExists(atPath: slotRoot.path),
-            !isBinlogLockedByRunningInstance(legacyDatabase.appendingPathComponent("td.binlog"))
+            let apiIDString = values["COCOGRAM_API_ID"],
+            let apiID = Int(apiIDString),
+            let apiHash = values["COCOGRAM_API_HASH"],
+            !apiHash.isEmpty
         else {
-            return
+            return nil
         }
-
-        do {
-            try fileManager.createDirectory(at: slotRoot, withIntermediateDirectories: true)
-            try fileManager.moveItem(at: legacyDatabase, to: slotRoot.appendingPathComponent("database"))
-        } catch {
-            return
-        }
-
-        let legacyFiles = tdlibRoot.appendingPathComponent("files", isDirectory: true)
-        if fileManager.fileExists(atPath: legacyFiles.path) {
-            try? fileManager.moveItem(at: legacyFiles, to: slotRoot.appendingPathComponent("files"))
-        }
+        return (apiID, apiHash, values["COCOGRAM_TDLIB_TEST_DC"] == "1")
     }
 
-    /// TDLib holds an exclusive `fcntl` write lock on `td.binlog` for the lifetime of the
-    /// process using it. Probing that lock tells us whether moving the directory would
-    /// yank the database out from under a still-running instance.
-    private static func isBinlogLockedByRunningInstance(_ binlogURL: URL) -> Bool {
-        let descriptor = open(binlogURL.path, O_RDWR)
-        guard descriptor >= 0 else { return false }
-        defer { close(descriptor) }
+    /// Pins the credentials of an established session into its database directory so every
+    /// future launch — any build, any working directory — reuses them. Called once auth
+    /// reaches Ready (the credentials are proven good). Never overwrites an existing pin.
+    /// See `SESSION_PERSISTENCE_INVARIANT.md` (RULE B).
+    static func pinSessionCredentials(_ configuration: TDLibConfiguration) {
+        let url = pinURL(inDatabaseDirectory: configuration.databaseDirectory)
+        guard !FileManager.default.fileExists(atPath: url.path) else { return }
 
-        var lock = flock()
-        lock.l_type = Int16(F_WRLCK)
-        lock.l_whence = Int16(SEEK_SET)
-        return fcntl(descriptor, F_SETLK, &lock) == -1
+        var lines = [
+            "# Written by CocoGram. Pins the credentials this Telegram session was created",
+            "# with so they are reused on every launch and the session is never lost. Delete",
+            "# this file (or the database directory) to force a fresh login. See",
+            "# SESSION_PERSISTENCE_INVARIANT.md.",
+            "COCOGRAM_API_ID=\(configuration.apiID)",
+            "COCOGRAM_API_HASH=\(configuration.apiHash)"
+        ]
+        if configuration.useTestDataCenter {
+            lines.append("COCOGRAM_TDLIB_TEST_DC=1")
+        }
+        try? Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    /// Clears the pin so newly-entered credentials take effect on the next launch. Called
+    /// ONLY when the user deliberately saves credentials via the setup screen (an account
+    /// switch) — never on a normal launch.
+    static func clearSessionCredentialPin() {
+        try? FileManager.default.removeItem(at: pinURL(inDatabaseDirectory: defaultDatabaseDirectory()))
     }
 
     /// True when usable credentials already exist anywhere — used to decide whether the
@@ -149,6 +167,11 @@ struct TDLibConfiguration {
         let url = savedCredentialsURL
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+
+        // The user deliberately chose these credentials, so drop any existing pin: this is
+        // the one sanctioned path for switching the api_id, and the new credentials must
+        // take effect on the next launch. See SESSION_PERSISTENCE_INVARIANT.md.
+        clearSessionCredentialPin()
     }
 
     private static func savedConfiguration() -> [String: String] {
@@ -541,6 +564,10 @@ final class TDLibTelegramClient: TelegramClient {
         case .authorizationStateWaitPassword:
             continuation.yield(.authorizationStateChanged(.waitingForPassword))
         case .authorizationStateReady:
+            // Pin the credentials this now-established session was created with, so every
+            // future launch reuses them and the session is never lost. See
+            // SESSION_PERSISTENCE_INVARIANT.md.
+            TDLibConfiguration.pinSessionCredentials(configuration)
             continuation.yield(.authorizationStateChanged(.ready))
             Task { @MainActor [weak self] in
                 guard let self else { return }

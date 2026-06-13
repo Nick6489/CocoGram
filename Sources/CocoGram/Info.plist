@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Embedded into the CocoGram executable's __TEXT,__info_plist section via linker flags
+  in Package.swift. This gives the bare `swift build` / `swift run` binary (which has no
+  surrounding .app bundle) the identity and, crucially, the NSMicrophoneUsageDescription
+  that TCC requires before it will show the microphone permission prompt during
+  development. The distributed .app uses Contents/Info.plist written by scripts/package.sh
+  (kept in sync with this file); keep NSMicrophoneUsageDescription identical in both.
+-->
+<dict>
+    <key>CFBundleName</key>            <string>CocoGram</string>
+    <key>CFBundleDisplayName</key>     <string>CocoGram</string>
+    <key>CFBundleIdentifier</key>      <string>me.giannak.nick.cocogram</string>
+    <key>CFBundleExecutable</key>      <string>CocoGram</string>
+    <key>CFBundlePackageType</key>     <string>APPL</string>
+    <key>CFBundleShortVersionString</key> <string>0.1.0</string>
+    <key>CFBundleVersion</key>         <string>1</string>
+    <key>LSMinimumSystemVersion</key>  <string>15.0</string>
+    <key>NSHighResolutionCapable</key> <true/>
+    <key>NSPrincipalClass</key>        <string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key> <string>CocoGram uses the microphone to record voice messages.</string>
+</dict>
+</plist>
