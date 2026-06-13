@@ -275,8 +275,15 @@ final class TDLibTelegramClient: TelegramClient {
         // Close only this instance's client — the shared manager may already be running
         // a replacement session. The blocking flush-everything wait lives in
         // `shutdownAllClients()` and happens once, at app termination.
+        //
+        // The completion MUST be the nonisolated `ignoreTDLibOKResult`, not a `{ _ in }`
+        // literal: a closure formed in this @MainActor method is @MainActor-isolated, and
+        // TDLibKit invokes the close completion later on its background update-handler
+        // queue. Swift's isolation precondition then traps (EXC_BREAKPOINT) for using a
+        // main-actor closure off the main thread — which crashed the app ~30s after quit,
+        // once TDLib finished flushing and delivered the close response.
         if let client {
-            try? client.close(completion: { _ in })
+            try? client.close(completion: ignoreTDLibOKResult)
         }
         client = nil
         continuation.finish()
