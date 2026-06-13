@@ -90,6 +90,21 @@ swift "$ROOT/scripts/make_icon.swift" "$ICONSET"
 iconutil -c icns "$ICONSET" -o "$RES_DIR/AppIcon.icns"
 rm -rf "$ICONSET"
 
+# ---- 4b. Bundle UI sound effects ---------------------------------------------------
+# Copied into Resources/Sounds BEFORE signing so they are sealed by the app signature
+# (and thus survive notarization/stapling). The app loads them via
+# Bundle.main/Resources/Sounds; `swift run` uses the SPM resource bundle instead.
+say "Bundling sound effects"
+SOUNDS_SRC="$ROOT/Sources/CocoGram/Sounds"
+SOUNDS_DST="$RES_DIR/Sounds"
+[ -d "$SOUNDS_SRC" ] || { echo "ERROR: sounds source not found at $SOUNDS_SRC" >&2; exit 1; }
+rm -rf "$SOUNDS_DST"
+mkdir -p "$SOUNDS_DST"
+cp "$SOUNDS_SRC"/*.m4a "$SOUNDS_DST"/
+SOUND_COUNT=$(ls -1 "$SOUNDS_DST"/*.m4a 2>/dev/null | wc -l | tr -d ' ')
+[ "$SOUND_COUNT" -gt 0 ] || { echo "ERROR: no sound files were bundled" >&2; exit 1; }
+echo "  bundled $SOUND_COUNT sound file(s) into Resources/Sounds"
+
 # ---- 5. Code signing (hardened runtime, required for notarization) -----------------
 # The app gets the audio-input entitlement; the hardened runtime blocks the microphone
 # without it even though Info.plist declares NSMicrophoneUsageDescription. Frameworks are
@@ -112,6 +127,11 @@ say "Verifying microphone entitlement is present"
 codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.device.audio-input" \
     && echo "  audio-input entitlement: OK" \
     || { echo "ERROR: audio-input entitlement missing from signed app" >&2; exit 1; }
+say "Verifying sound effects are in the signed bundle"
+SIGNED_SOUNDS=$(ls -1 "$APP/Contents/Resources/Sounds"/*.m4a 2>/dev/null | wc -l | tr -d ' ')
+[ "$SIGNED_SOUNDS" -gt 0 ] \
+    && echo "  $SIGNED_SOUNDS sound file(s) present in signed bundle" \
+    || { echo "ERROR: sound effects missing from signed app" >&2; exit 1; }
 
 if [ "$SKIP_NOTARIZE" = "1" ]; then
     say "SKIP_NOTARIZE=1 — stopping after sign. App at: $APP"

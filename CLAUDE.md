@@ -63,13 +63,25 @@ The first run prompts; if a later build stops recording, reset with
 `tccutil reset Microphone me.giannak.nick.cocogram`, or test mic flows against the signed
 bundle (`scripts/package.sh` with `SKIP_NOTARIZE=1`), which has a stable identity.
 
-**TDLib storage is keyed per credential set**: the database and files live in
-`~/Library/Application Support/CocoGram/tdlib/api-<api_id>[-test]/`. This matters because
-`.cocogram.local` is read from the process working directory — a dev `swift run` and an
-installed app launched from Finder can resolve *different* api_id values, and reusing one
-TDLib database across api_ids gets the Telegram session revoked server-side (which is a
-full phone+OTP re-login). Each credential set therefore keeps its own session. A TDLib
-log (warnings and errors) is written to `tdlib.log` next to each database directory.
+**TDLib storage uses one fixed path + credential pinning** (see
+[`SESSION_PERSISTENCE_INVARIANT.md`](SESSION_PERSISTENCE_INVARIANT.md)): the database and
+files live at the constant `~/Library/Application Support/CocoGram/tdlib/database` (+
+`/files`), never keyed on api_id/cwd/env/which-binary. On first login the api_id/api_hash
+are pinned into `tdlib/database/session.pin` and reused forever; launch-time config
+(`.cocogram.local`, `credentials.conf`, env) is consulted only to bootstrap that first
+login. This is what guarantees a logged-in user is never forced to re-authenticate. A TDLib
+log (warnings and errors) is written to `tdlib.log` next to the database directory.
+**Per-api_id storage slots are forbidden** — they caused a re-auth regression once.
+
+### Sound effects (`SoundEffects.swift`)
+
+Short UI cues (recording Start/Pause/Stop, Send, Receive Same-Window/Push) live in
+`Sources/CocoGram/Sounds/*.m4a`, declared as an SPM `.copy("Sounds")` resource so
+`swift run` finds them via `Bundle.module`. `scripts/package.sh` copies them into the
+bundle's `Resources/Sounds` **before** code signing (so they're sealed and survive
+notarization), and the app loads them via `Bundle.main`. Cues are **additive** — they never
+replace VoiceOver announcements; recording cues are sequenced around capture so they aren't
+recorded into the message.
 
 ## Architecture
 

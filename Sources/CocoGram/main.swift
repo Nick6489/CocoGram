@@ -1134,13 +1134,22 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         loadMessages(for: currentConversationID)
     }
 
-    /// Appends messages pushed by a live update so the open conversation stays current.
-    /// Outgoing messages are skipped: the send path already appends them locally, and a
-    /// pushed copy can't be deduplicated (the Message model carries no id).
+    /// Handles messages pushed by a live update. Plays a receive cue — "Same Window" when
+    /// the message is for the open chat (and appends it), "Push" otherwise — and only for
+    /// incoming messages. Outgoing messages are skipped: the send path already appends them
+    /// locally and plays the send cue, and a pushed copy can't be deduplicated (the Message
+    /// model carries no id).
     func applyIncomingMessages(chatID: Int64, messages newMessages: [Message]) {
-        guard currentConversationID == chatID else { return }
-        for message in newMessages where !message.isOutgoing {
-            appendMessageToTable(message)
+        let incoming = newMessages.filter { !$0.isOutgoing }
+        guard !incoming.isEmpty else { return }
+
+        if currentConversationID == chatID {
+            SoundEffects.shared.play(.receiveMessageSameWindow)
+            for message in incoming {
+                appendMessageToTable(message)
+            }
+        } else {
+            SoundEffects.shared.play(.receiveMessagePush)
         }
     }
 
@@ -1411,6 +1420,7 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         let text = composerField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         composerField.stringValue = ""
+        SoundEffects.shared.play(.sendMessage)
 
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1946,16 +1956,23 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         case .preparing:
             return
         case .recording:
+            // Pause capture first, then play the cue so it isn't recorded.
             recorder?.pause()
             updateState(.recordingPaused)
             timer?.invalidate()
+            SoundEffects.shared.play(.pauseRecording)
         case .recordingPaused:
-            do {
-                try recorder?.resume()
-                updateState(.recording)
-                startTimer()
-            } catch {
-                showRecordingError("Couldn't resume recording: \(error.localizedDescription)")
+            // Play the resume (Start) cue first, then resume capture in its completion so
+            // the cue isn't recorded.
+            SoundEffects.shared.play(.startRecording) { [weak self] in
+                guard let self, !self.isClosing, self.state == .recordingPaused else { return }
+                do {
+                    try self.recorder?.resume()
+                    self.updateState(.recording)
+                    self.startTimer()
+                } catch {
+                    self.showRecordingError("Couldn't resume recording: \(error.localizedDescription)")
+                }
             }
         case .previewReady:
             playPreview(restarting: true)
@@ -1977,6 +1994,8 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             showRecordingError("The recording couldn't be saved: \(captureFailure.localizedDescription)")
             return
         }
+        // Capture has stopped, so the Stop cue won't be recorded.
+        SoundEffects.shared.play(.stopRecording)
         updateState(.previewReady)
     }
 
@@ -1993,6 +2012,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             return
         }
         didTransferRecording = true
+        SoundEffects.shared.play(.sendMessage)
         onSend?(recordingURL, recordedDuration)
         closeSheet()
     }
@@ -2129,13 +2149,22 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             // Records at the input device's native rate/channels; the send path resamples
             // to 48 kHz stereo once, in OggOpusEncoder. See VoiceMessageRecorder.
             let recorder = try VoiceMessageRecorder(url: url)
-            try recorder.start()
-
             recordingURL = url
             self.recorder = recorder
-            updateState(.recording)
-            startTimer()
-            announce("Recording started")
+
+            // Play the Start cue first, then begin capture in its completion so the cue
+            // itself isn't recorded into the message.
+            SoundEffects.shared.play(.startRecording) { [weak self] in
+                guard let self, !self.isClosing, self.recorder === recorder else { return }
+                do {
+                    try recorder.start()
+                    self.updateState(.recording)
+                    self.startTimer()
+                    self.announce("Recording started")
+                } catch {
+                    self.showRecordingError("Couldn't start recording: \(error.localizedDescription)")
+                }
+            }
         } catch {
             showRecordingError("Couldn't start recording: \(error.localizedDescription)")
         }

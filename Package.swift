@@ -26,6 +26,11 @@ let package = Package(
             ],
             // Info.plist is consumed by the linker (below), not bundled as a resource.
             exclude: ["Info.plist"],
+            // UI sound effects. Bundled for `swift run` via Bundle.module; the distributed
+            // .app gets them copied into Contents/Resources/Sounds by scripts/package.sh.
+            resources: [
+                .copy("Sounds")
+            ],
             // Embed Info.plist into the binary's __TEXT,__info_plist section so the
             // un-bundled `swift run` build carries NSMicrophoneUsageDescription — without
             // it, macOS TCC never shows the microphone prompt during development. The
