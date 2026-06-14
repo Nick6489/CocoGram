@@ -938,6 +938,10 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     private var recordingDialogController: RecordingDialogController?
     private var messages: [Message] = []
     private var currentConversationID: Int64?
+    /// The in-flight history load. A cold chat's load polls TDLib for up to a few seconds
+    /// (see `loadRecentHistory`), so switching chats rapidly must cancel the prior load —
+    /// otherwise overlapping poll loops pile up on the main actor doing discarded work.
+    private var messageLoadTask: Task<Void, Never>?
     private var audioPlayer: AVAudioPlayer?
     private var playingVoiceFileID: Int?
     private var playbackTask: Task<Void, Never>?
@@ -1150,14 +1154,17 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     private func loadMessages(for conversationID: Int64) {
-        Task { @MainActor [weak self] in
+        // Cancel any prior in-flight load: a cold chat polls TDLib for a few seconds, and a
+        // fast chat switch would otherwise leave the previous poll loop running for nothing.
+        messageLoadTask?.cancel()
+        messageLoadTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 let loadedMessages = try await telegramClient.loadMessages(chatID: conversationID)
-                guard currentConversationID == conversationID else { return }
+                guard !Task.isCancelled, currentConversationID == conversationID else { return }
                 replaceMessages(loadedMessages, selectLast: false)
             } catch {
-                guard currentConversationID == conversationID else { return }
+                guard !Task.isCancelled, currentConversationID == conversationID else { return }
                 print("Failed to load messages for chat \(conversationID): \(error.localizedDescription)")
                 replaceMessages([], selectLast: false)
             }

@@ -248,6 +248,52 @@ final class TDLibTelegramClient: TelegramClient {
     private var needsChatsRefresh = false
     private var isChatsRefreshRunning = false
 
+    /// Diagnostics, populated only under the headless self-test (`COCOGRAM_SELFTEST_TDLIB`).
+    /// Records every `updateNewMessage` the client receives so the test can quantify the
+    /// initial-sync backfill flood that drives the spurious receive sound effects.
+    private let diagnosticsEnabled = ProcessInfo.processInfo.environment["COCOGRAM_SELFTEST_TDLIB"] == "1"
+    private var diagnosticNewMessages: [(date: Int, isOutgoing: Bool, treatedAsLive: Bool)] = []
+    /// Records the most recent `loadRecentHistory` outcome for the self-test report.
+    private var diagnosticLastHistoryLoad: (localFirst: Int, polls: Int, final: Int)?
+
+    /// Unix time at which this session started. Used to tell a genuinely-new message apart
+    /// from initial-sync backfill: while populating a cold or stale local database, TDLib
+    /// delivers `updateNewMessage` for every historical message it downloads. Those carry
+    /// their original (old) send dates, so anything older than the session start is backfill
+    /// and must not ring the receive cue — otherwise reopening the app after time away
+    /// machine-guns dozens of sound effects (see the goal's "bombards … with sound effects").
+    private var sessionStartUnix: Int?
+
+    /// Slack on the live-arrival cutoff: absorbs clock skew between this Mac and Telegram's
+    /// servers and messages already in flight at launch. Backfill is always far older.
+    private static let liveArrivalGraceSeconds = 5
+    /// Canary margin for clock skew: warn only when a suppressed incoming message missed the
+    /// live cutoff by no more than this (i.e. it was *just barely* classified as backfill).
+    /// Messages older than the cutoff by more than this are ordinary recent backfill (a message
+    /// that arrived shortly before launch) and must NOT be flagged — only a near-boundary miss
+    /// suggests clock skew larger than the grace window dropped a genuinely-new message.
+    private static let nearMissMarginSeconds = 10
+
+    // Recent-history loading (Bug 1). `getChatHistory` is offline-first: the first call on a
+    // freshly-opened chat returns only what's cached locally — often just the last message —
+    // and kicks off a background server fetch whose page lands a beat later. These tune the
+    // "wait for the page" poll. Measured fetch latency on a real session was well under 500ms.
+    private static let recentHistoryLimit = 100
+    /// A local cache at least this large is treated as already-synced: return it immediately
+    /// so opening a previously-loaded chat stays instant. Comfortably above the cold-cache
+    /// counts (1–3 messages) and below a typical synced page.
+    private static let warmHistoryThreshold = 20
+    private static let historyPollMilliseconds = 300
+    /// Hard cap on poll iterations (≈ maxPolls × pollMs worst case) so a slow network can't
+    /// stall a chat open indefinitely.
+    private static let maxHistoryPolls = 9
+    /// A result this small is the very bug symptom, so wait this many no-growth polls before
+    /// accepting it as the whole story — the server fetch must be given time to land.
+    private static let tinyHistoryCeiling = 3
+    private static let tinyStallPolls = 6
+    /// A substantial result that stops growing for this many polls is complete.
+    private static let substantialStallPolls = 2
+
     init(configuration: TDLibConfiguration) {
         self.configuration = configuration
         let stream = AsyncStream<TelegramUpdate>.makeStream()
@@ -257,6 +303,9 @@ final class TDLibTelegramClient: TelegramClient {
 
     func start() async throws {
         guard !isStopping else { return }
+        if sessionStartUnix == nil {
+            sessionStartUnix = Int(Date().timeIntervalSince1970)
+        }
         try prepareStorage()
         if client == nil {
             let updateBridge = updateBridge
@@ -334,9 +383,8 @@ final class TDLibTelegramClient: TelegramClient {
         } as Ok
 
         let chat = try? await fetchChat(id: chatID)
-        let history = try await loadLatestMessages(chatID: chatID)
+        var tdMessages = try await loadRecentHistory(chatID: chatID)
 
-        var tdMessages = history.messages ?? []
         if tdMessages.isEmpty, let lastMessage = chat?.lastMessage {
             tdMessages = [lastMessage]
         }
@@ -486,17 +534,80 @@ final class TDLibTelegramClient: TelegramClient {
         try? client.setLogVerbosityLevel(newVerbosityLevel: 2, completion: ignoreTDLibOKResult)
     }
 
-    private func loadLatestMessages(chatID: Int64) async throws -> Messages {
-        try await runTDLibRequest { completion in
+    /// Loads the most recent slice of a chat's history, reliably.
+    ///
+    /// `getChatHistory` returns only messages already in the local database. The first call
+    /// after a chat is opened for the first time usually finds just the chat's last message
+    /// (delivered earlier via `updateChatLastMessage`), so it returns one message and starts
+    /// a background server fetch whose page arrives a beat later. A single call therefore
+    /// renders "only the most recent message" until the chat is reopened — the reported Bug 1.
+    ///
+    /// Strategy:
+    ///  - If the local database already holds a substantial recent history, return it at once
+    ///    so reopening a synced chat stays instant.
+    ///  - Otherwise force a server fetch and poll until the returned count stops growing (the
+    ///    page has landed) or a small time budget is spent. Growth is the only reliable
+    ///    signal: TDLib may return fewer than `limit` even when more exist, so "fewer than
+    ///    requested" cannot be read as "that is everything."
+    private func loadRecentHistory(chatID: Int64) async throws -> [TDLibKit.Message] {
+        let limit = Self.recentHistoryLimit
+
+        // Fast path: a healthy local cache means the recent history is already here.
+        let local = (try? await getChatHistory(chatID: chatID, limit: limit, onlyLocal: true)) ?? []
+        if local.count >= Self.warmHistoryThreshold {
+            if diagnosticsEnabled {
+                diagnosticLastHistoryLoad = (localFirst: local.count, polls: 0, final: local.count)
+            }
+            return local
+        }
+
+        // Cold (or genuinely short) chat: ask the server and wait for the page to arrive.
+        var best = local
+        var stalledPolls = 0
+        var polls = 0
+        while polls < Self.maxHistoryPolls {
+            // Bail if the caller (a chat-open Task) was cancelled — e.g. the user already
+            // switched to another chat. No point spending more polls on a discarded result.
+            if Task.isCancelled { break }
+            polls += 1
+            let batch = (try? await getChatHistory(chatID: chatID, limit: limit, onlyLocal: false)) ?? []
+            if batch.count > best.count {
+                best = batch
+                stalledPolls = 0
+            } else {
+                stalledPolls += 1
+            }
+
+            if best.count >= limit { break }                       // full page; nothing more to fetch
+            if best.count >= Self.warmHistoryThreshold { break }   // grew into a healthy history
+            // A tiny result is the bug symptom; give the server fetch longer to land before
+            // accepting it. A larger-but-short result that stops growing is genuinely complete.
+            let stallBudget = best.count <= Self.tinyHistoryCeiling
+                ? Self.tinyStallPolls
+                : Self.substantialStallPolls
+            if stalledPolls >= stallBudget { break }
+
+            try? await Task.sleep(for: .milliseconds(Self.historyPollMilliseconds))
+        }
+
+        if diagnosticsEnabled {
+            diagnosticLastHistoryLoad = (localFirst: local.count, polls: polls, final: best.count)
+        }
+        return best
+    }
+
+    private func getChatHistory(chatID: Int64, limit: Int, onlyLocal: Bool) async throws -> [TDLibKit.Message] {
+        let result: Messages = try await runTDLibRequest { completion in
             try tdClient.getChatHistory(
                 chatId: chatID,
                 fromMessageId: 0,
-                limit: 100,
+                limit: limit,
                 offset: 0,
-                onlyLocal: false,
+                onlyLocal: onlyLocal,
                 completion: completion
             )
         }
+        return result.messages ?? []
     }
 
     fileprivate func handleUpdateData(_ data: Data, client: TDLibClient) {
@@ -530,6 +641,17 @@ final class TDLibTelegramClient: TelegramClient {
             chatLastMessageCache[update.chatId] = update.lastMessage
             scheduleChatsRefresh()
         case .updateNewMessage(let update):
+            let live = isLiveArrival(update.message)
+            if diagnosticsEnabled {
+                diagnosticNewMessages.append((update.message.date, update.message.isOutgoing, live))
+            }
+            // Backfill streamed in during initial sync (messages predating this session)
+            // must not append out of order or ring the receive cue. Genuinely-new messages
+            // — sent at or after the session began — flow through as before.
+            guard live else {
+                warnIfNearMissSuppression(update.message)
+                return
+            }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let message = await mapMessage(update.message)
@@ -542,6 +664,30 @@ final class TDLibTelegramClient: TelegramClient {
         default:
             break
         }
+    }
+
+    /// A message is a live arrival — worth a receive cue and a live append to the open chat —
+    /// only if it was sent at or after this session began (minus a little slack). Initial-sync
+    /// backfill carries old dates and fails this test. Before the session start is known
+    /// (it is set in `start()`), default to live so nothing is ever silently dropped.
+    private func isLiveArrival(_ message: TDLibKit.Message) -> Bool {
+        guard let sessionStartUnix else { return true }
+        return message.date >= sessionStartUnix - Self.liveArrivalGraceSeconds
+    }
+
+    /// Canary for the (rare) case where clock skew larger than the grace window could cause a
+    /// genuinely-new incoming message to be misclassified as backfill and dropped. Fires only
+    /// for an incoming message that missed the live cutoff by a hair (within the near-miss
+    /// margin) — ordinary recent backfill misses it by far more and never trips this.
+    private func warnIfNearMissSuppression(_ message: TDLibKit.Message) {
+        guard !message.isOutgoing, let sessionStartUnix else { return }
+        let cutoff = sessionStartUnix - Self.liveArrivalGraceSeconds  // message.date < cutoff (already suppressed)
+        let missedBy = cutoff - message.date
+        guard missedBy <= Self.nearMissMarginSeconds else { return }
+        let warning = "[CocoGram] suppressed an incoming message that missed the live cutoff by "
+            + "\(missedBy)s; if it was actually new, the system clock may be skewed beyond the "
+            + "\(Self.liveArrivalGraceSeconds)s grace.\n"
+        FileHandle.standardError.write(Data(warning.utf8))
     }
 
     private func retainVoiceUpload(_ url: URL, for fileID: Int) {
@@ -874,6 +1020,120 @@ final class TDLibTelegramClient: TelegramClient {
         formatter.dateStyle = .short
         formatter.timeStyle = .short
         return formatter.string(from: date)
+    }
+
+    // MARK: - Headless diagnostics (COCOGRAM_SELFTEST_TDLIB)
+
+    /// Probes the real, signed-in session read-only to confirm the two reported bugs and
+    /// (after the fix) their absence. Never writes to the account beyond `openChat`/`closeChat`
+    /// (no `viewMessages`, so nothing is marked read). Returns a human-readable report.
+    func runMessageLoadingDiagnostic() async -> String {
+        var lines: [String] = []
+        func emit(_ line: String) { lines.append(line) }
+
+        let conversations = (try? await loadChats()) ?? []
+        emit("Loaded \(conversations.count) chats from the main list.")
+
+        // Phase 0 — the primary fix demonstration, run as the very first action so the cache is
+        // as cold as possible (background sync warms active chats within a few hundred ms). The
+        // app's real loadMessages path is exercised on a spread of chats across the list. A cold
+        // chat with real history shows localFirst small and final large with polls>0 — direct
+        // proof the fix waits for the server page instead of returning just the latest message.
+        emit("--- FIXED loadMessages, coldest moment after ready (the app's real path) ---")
+        let spread = stride(from: 0, to: conversations.count, by: 7).prefix(8).map { conversations[$0] }
+        for convo in spread {
+            let cached = await rawHistoryCount(chatID: convo.id, onlyLocal: true)
+            let loaded = (try? await loadMessages(chatID: convo.id).count) ?? -1
+            _ = try? await runTDLibRequest { completion in
+                try tdClient.closeChat(chatId: convo.id, completion: completion)
+            } as Ok
+            let stats = diagnosticLastHistoryLoad
+            emit("  • \(truncatedTitle(convo.title)): cached=\(cached) → loadMessages=\(loaded) "
+                + "(localFirst=\(stats?.localFirst ?? -1), polls=\(stats?.polls ?? -1), final=\(stats?.final ?? -1))")
+        }
+
+        // Phase A — quantify Bug 1. How many chats have only their last message (or nothing)
+        // in the local database? Those are the chats that would render just the latest
+        // message on first open. onlyLocal=true is an offline read: no network, no side effect.
+        var candidates: [(id: Int64, title: String, local: Int)] = []
+        var onlyLatest = 0
+        var healthy = 0
+        for convo in conversations {
+            let local = await rawHistoryCount(chatID: convo.id, onlyLocal: true)
+            let hasContent = (chatCache[convo.id]?.lastMessage ?? (chatLastMessageCache[convo.id] ?? nil)) != nil
+            if local <= 1 && hasContent { onlyLatest += 1 }
+            if local < Self.warmHistoryThreshold && hasContent {
+                candidates.append((convo.id, convo.title, local))
+            } else {
+                healthy += 1
+            }
+        }
+        candidates.sort { $0.local < $1.local }  // coldest first, to probe before sync warms them
+        emit("Bug 1 surface: \(onlyLatest)/\(conversations.count) chats have <=1 message cached "
+            + "(would show only the latest on first open); \(healthy) already have a full history cached.")
+
+        // Phase B — deep probe of chats that are STILL cold (<=1 cached) right now (re-measured,
+        // not the stale Phase A snapshot, since background sync warms most chats within seconds).
+        // Polls the server patiently and logs count + reported totalCount over time, to confirm
+        // a chat returning one message genuinely has one (totalCount==1, stable) rather than the
+        // server fetch simply lagging — i.e. that the fix's give-up is correct, not premature.
+        var stillCold: [(id: Int64, title: String)] = []
+        for chat in candidates where stillCold.count < 2 {
+            if await rawHistoryCount(chatID: chat.id, onlyLocal: true) <= 1 {
+                stillCold.append((chat.id, chat.title))
+            }
+        }
+        if !stillCold.isEmpty {
+            emit("--- Deep probe of still-cold chats (count@elapsedMs; [totalCount]) ---")
+            for chat in stillCold {
+                _ = try? await runTDLibRequest { completion in
+                    try tdClient.openChat(chatId: chat.id, completion: completion)
+                } as Ok
+                let probeStart = Date()
+                var series: [String] = []
+                var maxSeen = 0
+                for _ in 0..<8 {
+                    let result: Messages? = try? await runTDLibRequest { completion in
+                        try tdClient.getChatHistory(
+                            chatId: chat.id, fromMessageId: 0, limit: Self.recentHistoryLimit,
+                            offset: 0, onlyLocal: false, completion: completion
+                        )
+                    }
+                    let count = result?.messages?.count ?? 0
+                    maxSeen = max(maxSeen, count)
+                    series.append("\(count)@\(Int(probeStart.distance(to: Date()) * 1000))ms[\(result?.totalCount ?? -1)]")
+                    if count >= Self.warmHistoryThreshold { break }
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+                _ = try? await runTDLibRequest { completion in
+                    try tdClient.closeChat(chatId: chat.id, completion: completion)
+                } as Ok
+                emit("  • \(truncatedTitle(chat.title)) (max \(maxSeen)): \(series.joined(separator: " "))")
+            }
+        }
+
+        // Bug 2 — summarize the updateNewMessage stream observed since start.
+        emit("--- Bug 2: updateNewMessage classification since session start ---")
+        let now = Int(Date().timeIntervalSince1970)
+        let incoming = diagnosticNewMessages.filter { !$0.isOutgoing }
+        let live = incoming.filter { $0.treatedAsLive }
+        let suppressed = incoming.filter { !$0.treatedAsLive }
+        emit("Total updateNewMessage: \(diagnosticNewMessages.count) (incoming \(incoming.count), outgoing \(diagnosticNewMessages.count - incoming.count)).")
+        emit("Incoming classified LIVE (would ring receive cue): \(live.count); SUPPRESSED as backfill: \(suppressed.count).")
+        if let oldest = incoming.map({ now - $0.date }).max() {
+            emit("Oldest incoming updateNewMessage age: \(oldest)s; newest: \(incoming.map { now - $0.date }.min() ?? 0)s.")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func rawHistoryCount(chatID: Int64, onlyLocal: Bool) async -> Int {
+        let messages = (try? await getChatHistory(chatID: chatID, limit: Self.recentHistoryLimit, onlyLocal: onlyLocal)) ?? []
+        return messages.count
+    }
+
+    private func truncatedTitle(_ title: String) -> String {
+        title.count <= 28 ? title : String(title.prefix(27)) + "…"
     }
 
     private func runTDLibRequest<ResultType: Sendable>(
