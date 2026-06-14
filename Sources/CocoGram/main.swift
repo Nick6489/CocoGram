@@ -1,10 +1,12 @@
 import AppKit
 @preconcurrency import AVFoundation
+import AVKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowController: MainWindowController?
     private var telegramClient: TelegramClient!
+    private var callController: CallController?
     private var setupWindow: NSWindow?
     private var settingsWindow: NSWindow?
     private var settingsCloseObserver: NSObjectProtocol?
@@ -51,10 +53,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastAuthState = nil
 
         telegramClient = client
+        callController = CallController(telegramClient: client)
         let controller = MainWindowController(telegramClient: client)
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
         windowController = controller
+        callController?.setParentWindow(controller.window)
         if let previousAuthSheet, let previousWindow = previousWindowController?.window {
             previousWindow.endSheet(previousAuthSheet)
         }
@@ -298,6 +302,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 windowController?.applyChats(conversations)
             case .messagesChanged(let chatID, let messages):
                 windowController?.applyIncomingMessages(chatID: chatID, messages: messages)
+            case .callChanged(let call):
+                callController?.setParentWindow(windowController?.window)
+                callController?.handle(call)
+            case .callSignalingData(let callID, let data):
+                callController?.handleSignalingData(data, callID: callID)
             case .startupStalled(let message):
                 announce(message)
             case .startupFailed(let message):
@@ -936,6 +945,10 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     private let playbackControls = NSStackView()
     private let playbackSeparator = NSBox()
     private var recordingDialogController: RecordingDialogController?
+    /// Closures backing the header action buttons (call, info, …), indexed by button tag.
+    private var headerButtonActions: [() -> Void] = []
+    /// Debounces the call button so rapid clicks can't fire duplicate createCall requests.
+    private var isStartingCall = false
     private var messages: [Message] = []
     private var currentConversationID: Int64?
     /// The in-flight history load. A cold chat's load polls TDLib for up to a few seconds
@@ -947,6 +960,22 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     private var playbackTask: Task<Void, Never>?
     private var decodedVoiceMessageURL: URL?
 
+    /// Downloads + caches inline media images (photos, stickers, video posters) by file id.
+    private lazy var imageLoader = MediaImageLoader { [weak self] fileID in
+        guard let self else { throw CocoaError(.fileNoSuchFile) }
+        return try await self.telegramClient.downloadFile(fileID: fileID)
+    }
+    /// Inline video playback. The player and its view live on the controller (not in a cell)
+    /// so playback survives table reloads and cell recycling; the view is re-attached to
+    /// whichever cell currently shows the playing message. Nothing ever autoplays.
+    private var videoPlayer: AVPlayer?
+    private var videoPlayerView: AVPlayerView?
+    private var playingVideoMessageID: Int64?
+    private var videoDownloadTask: Task<Void, Never>?
+    /// Scroll-back pagination state for the open conversation.
+    private var isLoadingOlder = false
+    private var reachedStartOfHistory = false
+
     init(telegramClient: TelegramClient) {
         self.telegramClient = telegramClient
         super.init(nibName: nil, bundle: nil)
@@ -954,6 +983,12 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    deinit {
+        // The scroll observer is registered against this controller; drop it so a replaced
+        // controller (e.g. after a session restart) leaves nothing dangling in NotificationCenter.
+        NotificationCenter.default.removeObserver(self)
     }
 
     override func loadView() {
@@ -998,8 +1033,11 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         contentStack.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 20, right: 22)
 
         messageTableView.headerView = nil
-        messageTableView.rowHeight = 104
-        messageTableView.intercellSpacing = NSSize(width: 0, height: 8)
+        // Rows size themselves to their content (see MessageTableCellView's top-to-bottom
+        // constraint chain). The old fixed 104pt row + 8pt gap padded every short message with
+        // dead space; self-sizing + a hairline gap keeps messages tight, like the official app.
+        messageTableView.usesAutomaticRowHeights = true
+        messageTableView.intercellSpacing = NSSize(width: 0, height: 2)
         messageTableView.dataSource = self
         messageTableView.delegate = self
         messageTableView.selectionHighlightStyle = .regular
@@ -1014,6 +1052,14 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         messageScrollView.hasVerticalScroller = true
         messageScrollView.drawsBackground = false
         messageScrollView.isHidden = true
+        // Stream older history in as the user scrolls back toward the top.
+        messageScrollView.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(messageScrollDidChange),
+            name: NSView.boundsDidChangeNotification,
+            object: messageScrollView.contentView
+        )
 
         infoScrollView.documentView = contentStack
         infoScrollView.hasVerticalScroller = true
@@ -1102,9 +1148,11 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         if case .conversation(let conversation) = item {
             if currentConversationID != conversation.id {
                 stopVoicePlayback()
+                stopVideoPlayback()
             }
         } else {
             stopVoicePlayback()
+            stopVideoPlayback()
         }
         headerTitle.stringValue = item.title
         headerSubtitle.stringValue = item.subtitle
@@ -1122,6 +1170,7 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
             actionStack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+        headerButtonActions = []
 
         switch item {
         case .conversation(let conversation):
@@ -1136,8 +1185,12 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     private func showConversation(_ conversation: Conversation) {
-        addHeaderButton(title: "Audio Call", symbol: "phone.fill", help: "Start an audio call with \(conversation.title).")
-        addHeaderButton(title: "Video Call", symbol: "video.fill", help: "Start a video call with \(conversation.title).")
+        addHeaderButton(title: "Audio Call", symbol: "phone.fill", help: "Start an audio call with \(conversation.title).") { [weak self] in
+            self?.startCall(isVideo: false)
+        }
+        addHeaderButton(title: "Video Call", symbol: "video.fill", help: "Start a video call with \(conversation.title).") { [weak self] in
+            self?.startCall(isVideo: true)
+        }
         addHeaderButton(title: "Info", symbol: "info.circle", help: "Show chat information.")
 
         messageScrollView.isHidden = false
@@ -1172,6 +1225,9 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     private func replaceMessages(_ newMessages: [Message], selectLast: Bool) {
+        // Fresh history for this chat: pagination starts over.
+        reachedStartOfHistory = false
+        isLoadingOlder = false
         messages = newMessages
         messageTableView.reloadData()
         guard !messages.isEmpty else { return }
@@ -1184,6 +1240,146 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         } else {
             messageTableView.deselectAll(nil)
         }
+    }
+
+    @objc private func messageScrollDidChange() {
+        loadOlderMessagesIfNeeded()
+    }
+
+    /// When the viewport nears the top of the loaded history, stream in the next older page.
+    /// `force` bypasses the scroll-position check (used by the headless render test).
+    func loadOlderMessagesIfNeeded(force: Bool = false) {
+        guard !isLoadingOlder, !reachedStartOfHistory else { return }
+        guard let chatID = currentConversationID, let oldest = messages.first else { return }
+
+        if !force {
+            // "Near the top" — within roughly one screenful of the start, to prefetch the next
+            // older page before the user reaches the very top.
+            let offsetY = messageScrollView.contentView.bounds.origin.y
+            guard offsetY < messageScrollView.contentView.bounds.height else { return }
+        }
+
+        isLoadingOlder = true
+        let beforeID = oldest.id
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isLoadingOlder = false }
+            let older = (try? await telegramClient.loadOlderMessages(chatID: chatID, beforeMessageID: beforeID)) ?? []
+            // Bail if the chat changed or this page is stale.
+            guard currentConversationID == chatID, messages.first?.id == beforeID else { return }
+            if older.isEmpty {
+                reachedStartOfHistory = true
+                return
+            }
+            prependOlderMessages(older)
+        }
+    }
+
+    /// Inserts an older page above the current history while keeping the viewport visually
+    /// anchored on the message the user was looking at (so it doesn't jump to the top).
+    private func prependOlderMessages(_ older: [Message]) {
+        let clipView = messageScrollView.contentView
+        messageTableView.layoutSubtreeIfNeeded()
+        let heightBefore = messageTableView.bounds.height
+        let offsetBefore = clipView.bounds.origin
+
+        messages = older + messages
+        messageTableView.reloadData()
+        messageTableView.layoutSubtreeIfNeeded()
+
+        // Rows were added above; shift the scroll origin down by the inserted height so the
+        // previously-visible messages stay put (the document is flipped, top-anchored).
+        let heightAfter = messageTableView.bounds.height
+        let delta = heightAfter - heightBefore
+        clipView.setBoundsOrigin(NSPoint(x: offsetBefore.x, y: offsetBefore.y + delta))
+        messageScrollView.reflectScrolledClipView(clipView)
+    }
+
+    /// Begins inline playback of a video/animation. Downloads (and caches) the file first;
+    /// nothing autoplays — playback only starts here, in response to an explicit activation.
+    private func playVideo(_ media: VideoMedia, messageID: Int64) {
+        // Re-activating the message that is already playing/loading: toggle once the player
+        // exists, otherwise ignore (a download is in flight — don't restart it).
+        if playingVideoMessageID == messageID {
+            if let videoPlayer {
+                if videoPlayer.rate == 0 {
+                    videoPlayer.play()
+                    announce("Playing video")
+                } else {
+                    videoPlayer.pause()
+                    announce("Video paused")
+                }
+            }
+            return
+        }
+
+        stopVideoPlayback()
+        playingVideoMessageID = messageID
+        announce("Downloading video")
+        setVideoDownloadingIndicator(true, messageID: messageID)
+        videoDownloadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let url = try await telegramClient.downloadFile(fileID: media.videoFileID)
+                guard !Task.isCancelled, playingVideoMessageID == messageID else { return }
+                let player = AVPlayer(url: url)
+                let playerView = AVPlayerView()
+                playerView.player = player
+                playerView.controlsStyle = .inline
+                playerView.videoGravity = .resizeAspect
+                playerView.setAccessibilityLabel("Video player")
+                videoPlayer = player
+                videoPlayerView = playerView
+                // Swap the poster for the player IN PLACE on the live cell — no reloadData, which
+                // would recompute every row height and yank scroll/VoiceOver focus to another
+                // message (and could displace this one). The player matches the poster's size, so
+                // the row height is unchanged. Recycled-away rows re-attach via viewFor.
+                attachPlayerToPlayingRow()
+                player.play()  // explicit, user-initiated — never an autoplay
+                announce("Playing video")
+            } catch {
+                guard !Task.isCancelled, playingVideoMessageID == messageID else { return }
+                setVideoDownloadingIndicator(false, messageID: messageID)
+                playingVideoMessageID = nil
+                announce("Couldn't play that video: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func setVideoDownloadingIndicator(_ downloading: Bool, messageID: Int64) {
+        guard let row = messages.firstIndex(where: { $0.id == messageID }),
+              let cell = messageTableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? MessageTableCellView
+        else { return }
+        cell.setVideoDownloading(downloading)
+    }
+
+    /// Attaches the controller-owned player to the visible cell for the playing message, in
+    /// place, without reloading the table.
+    private func attachPlayerToPlayingRow() {
+        guard let playerView = videoPlayerView,
+              let messageID = playingVideoMessageID,
+              let row = messages.firstIndex(where: { $0.id == messageID }),
+              let cell = messageTableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? MessageTableCellView
+        else { return }
+        cell.attachInlineVideo(playerView)
+        cell.layoutSubtreeIfNeeded()  // give the player its frame now so it renders immediately
+    }
+
+    private func stopVideoPlayback() {
+        videoDownloadTask?.cancel()
+        videoPlayer?.pause()
+        videoPlayer = nil
+        // Restore the poster in whatever visible cell currently hosts the player, so stopping or
+        // switching videos never leaves a blank box where the message was.
+        if let messageID = playingVideoMessageID,
+           let row = messages.firstIndex(where: { $0.id == messageID }),
+           let cell = messageTableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? MessageTableCellView {
+            cell.detachInlineVideoAndRestorePoster()
+        }
+        videoPlayerView?.player = nil
+        videoPlayerView?.removeFromSuperview()
+        videoPlayerView = nil
+        playingVideoMessageID = nil
     }
 
     private func reloadSelectedConversation() {
@@ -1502,12 +1698,40 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
         messageTableView.scrollRowToVisible(row)
     }
 
-    private func addHeaderButton(title: String, symbol: String, help: String) {
+    private func addHeaderButton(title: String, symbol: String, help: String, action: (() -> Void)? = nil) {
         let button = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: title) ?? NSImage(), target: nil, action: nil)
         button.bezelStyle = .texturedRounded
         button.setAccessibilityLabel(title)
         button.setAccessibilityHelp(help)
+        if let action {
+            button.tag = headerButtonActions.count
+            headerButtonActions.append(action)
+            button.target = self
+            button.action = #selector(headerButtonTapped(_:))
+        }
         actionStack.addArrangedSubview(button)
+    }
+
+    @objc private func headerButtonTapped(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < headerButtonActions.count else { return }
+        headerButtonActions[sender.tag]()
+    }
+
+    /// Initiates a 1:1 call to the open conversation's user. Errors (e.g. group chats, which
+    /// don't support 1:1 calls) are announced. The resulting call UI is driven by AppDelegate's
+    /// call controller via the update stream.
+    private func startCall(isVideo: Bool) {
+        guard let chatID = currentConversationID, !isStartingCall else { return }
+        isStartingCall = true  // debounce: a second click can't fire a duplicate createCall
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isStartingCall = false }
+            do {
+                try await telegramClient.startCall(chatID: chatID, isVideo: isVideo)
+            } catch {
+                announce("Couldn't start the call: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func separator() -> NSView {
@@ -1521,22 +1745,24 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let cell = MessageTableCellView()
-        cell.configure(message: messages[row]) { [weak self] in
-            self?.playVoiceMessageIfPresent(at: row)
+        let message = messages[row]
+        let identifier = NSUserInterfaceItemIdentifier("MessageCell")
+        // Recycle cells: with self-sizing rows viewFor is called often (measure + display), so a
+        // fresh allocation each time is wasteful. configure() fully resets every region, and the
+        // async image set is guarded by file id, so a recycled cell never shows stale content.
+        let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? MessageTableCellView) ?? MessageTableCellView()
+        cell.identifier = identifier
+        cell.configure(
+            message: message,
+            imageLoader: imageLoader,
+            onPlayVoiceMessage: { [weak self] in self?.playVoiceMessageIfPresent(at: row) },
+            onPlayVideo: { [weak self] media in self?.playVideo(media, messageID: message.id) }
+        )
+        // If this row is the one currently playing video, hand it the controller-owned player.
+        if message.id == playingVideoMessageID, let videoPlayerView {
+            cell.attachInlineVideo(videoPlayerView)
         }
         return cell
-    }
-
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        switch messages[row].kind {
-        case .text:
-            return 92
-        case .voice:
-            return 124
-        case .media:
-            return 92
-        }
     }
 }
 
@@ -1901,8 +2127,11 @@ final class AccountSetupController: NSViewController {
 /// announced at high priority.
 final class SettingsViewController: NSViewController {
     private let microphonePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let sfxOutputPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let callOutputPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
     private var devices: [AudioInputDevice] = []
+    private var outputDevices: [AudioOutputDevice] = []
 
     override func loadView() {
         view = NSView()
@@ -1915,51 +2144,88 @@ final class SettingsViewController: NSViewController {
         titleLabel.setAccessibilityRole(.staticText)
         titleLabel.setAccessibilityLabel("Settings")
 
-        let sectionLabel = NSTextField(labelWithString: "Microphone")
-        sectionLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        sectionLabel.setAccessibilityRole(.staticText)
+        func sectionHeader(_ text: String) -> NSTextField {
+            let label = NSTextField(labelWithString: text)
+            label.font = .systemFont(ofSize: 15, weight: .semibold)
+            label.setAccessibilityRole(.staticText)
+            return label
+        }
+        func helpText(_ text: String) -> NSTextField {
+            let label = NSTextField(wrappingLabelWithString: text)
+            label.font = .systemFont(ofSize: 12)
+            label.textColor = .secondaryLabelColor
+            label.setAccessibilityLabel(text)
+            return label
+        }
+        func captionLabel(_ text: String) -> NSTextField {
+            let label = NSTextField(labelWithString: text)
+            label.font = .systemFont(ofSize: 12, weight: .semibold)
+            label.textColor = .secondaryLabelColor
+            label.setAccessibilityElement(false)
+            return label
+        }
+        func configure(_ popup: NSPopUpButton, accessibility: String, help: String, action: Selector) {
+            popup.target = self
+            popup.action = action
+            popup.setAccessibilityLabel(accessibility)
+            popup.setAccessibilityHelp(help)
+        }
 
-        let helpLabel = NSTextField(wrappingLabelWithString: "Choose which microphone records voice messages. This applies only to CocoGram — it doesn’t change your Mac’s sound input — and recording always uses the device’s own sample rate.")
-        helpLabel.font = .systemFont(ofSize: 12)
-        helpLabel.textColor = .secondaryLabelColor
-        helpLabel.setAccessibilityLabel(helpLabel.stringValue)
+        let micSection = sectionHeader("Microphone")
+        let micHelp = helpText("Choose which microphone records voice messages and is used for calls. This applies only to CocoGram — it doesn’t change your Mac’s sound input.")
+        let micCaption = captionLabel("Input device")
+        configure(microphonePopup, accessibility: "Microphone input device",
+                  help: "Choose which microphone records voice messages and is used for calls.",
+                  action: #selector(microphoneChanged))
 
-        let caption = NSTextField(labelWithString: "Input device")
-        caption.font = .systemFont(ofSize: 12, weight: .semibold)
-        caption.textColor = .secondaryLabelColor
-        caption.setAccessibilityElement(false)
+        let sfxSection = sectionHeader("Sound Effects")
+        let sfxHelp = helpText("Choose where CocoGram plays its interface sound effects.")
+        let sfxCaption = captionLabel("Output device")
+        configure(sfxOutputPopup, accessibility: "Sound effects output device",
+                  help: "Choose where CocoGram plays sound effects.",
+                  action: #selector(sfxOutputChanged))
 
-        microphonePopup.target = self
-        microphonePopup.action = #selector(microphoneChanged)
-        microphonePopup.setAccessibilityLabel("Microphone input device")
-        microphonePopup.setAccessibilityHelp("Choose which microphone records voice messages.")
+        let callSection = sectionHeader("Calls")
+        let callHelp = helpText("Choose where you hear calls. Pairing a separate microphone and speaker lets AirPods stay in high-quality audio instead of dropping to phone-call quality during a call.")
+        let callCaption = captionLabel("Output device")
+        configure(callOutputPopup, accessibility: "Call output device",
+                  help: "Choose where you hear calls.",
+                  action: #selector(callOutputChanged))
 
         statusLabel.font = .systemFont(ofSize: 12)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.setAccessibilityRole(.staticText)
 
-        let stack = NSStackView(views: [titleLabel, sectionLabel, helpLabel, caption, microphonePopup, statusLabel])
+        let stack = NSStackView(views: [
+            titleLabel,
+            micSection, micHelp, micCaption, microphonePopup,
+            sfxSection, sfxHelp, sfxCaption, sfxOutputPopup,
+            callSection, callHelp, callCaption, callOutputPopup,
+            statusLabel
+        ])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
+        stack.spacing = 8
         stack.edgeInsets = NSEdgeInsets(top: 24, left: 26, bottom: 24, right: 26)
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.setCustomSpacing(18, after: titleLabel)
-        stack.setCustomSpacing(16, after: helpLabel)
+        stack.setCustomSpacing(18, after: microphonePopup)
+        stack.setCustomSpacing(18, after: sfxOutputPopup)
+        stack.setCustomSpacing(16, after: callOutputPopup)
         view.addSubview(stack)
 
-        NSLayoutConstraint.activate([
+        let fullWidth: [NSView] = [titleLabel, micHelp, sfxHelp, callHelp, statusLabel,
+                                   microphonePopup, sfxOutputPopup, callOutputPopup]
+        var constraints = [
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             stack.topAnchor.constraint(equalTo: view.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            titleLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            helpLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            statusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            microphonePopup.widthAnchor.constraint(equalTo: stack.widthAnchor)
-        ])
+            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ]
+        constraints += fullWidth.map { $0.widthAnchor.constraint(equalTo: stack.widthAnchor) }
+        NSLayoutConstraint.activate(constraints)
 
-        view.setFrameSize(NSSize(width: 460, height: 260))
+        view.setFrameSize(NSSize(width: 460, height: 580))
         reloadDevices()
     }
 
@@ -1970,17 +2236,24 @@ final class SettingsViewController: NSViewController {
 
     private func reloadDevices() {
         devices = VoiceMessageRecorder.availableInputDevices()
+        outputDevices = CoreAudioDevices.availableOutputDevices()
 
         // Build menu items by hand (not addItem(withTitle:), which silently drops items
         // whose title duplicates an existing one — common with two similar interfaces).
-        // Item 0 is "System Default"; items 1… map to `devices`.
+        // Item 0 is "System Default"; items 1… map to the device list.
+        populateInputPopup()
+        populateOutputPopup(sfxOutputPopup, selectedUID: AudioOutputPreference.uid(for: .soundEffects))
+        populateOutputPopup(callOutputPopup, selectedUID: AudioOutputPreference.uid(for: .calls))
+        updateStatus()
+    }
+
+    private func populateInputPopup() {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "System Default", action: nil, keyEquivalent: ""))
         for device in devices {
             menu.addItem(NSMenuItem(title: device.name, action: nil, keyEquivalent: ""))
         }
         microphonePopup.menu = menu
-
         // Reflect the user's saved choice (a per-app preference; the system input is never
         // changed). Falls back to System Default if the saved device isn't connected.
         if let uid = AudioInputPreference.preferredUID, let index = devices.firstIndex(where: { $0.uid == uid }) {
@@ -1988,7 +2261,20 @@ final class SettingsViewController: NSViewController {
         } else {
             microphonePopup.selectItem(at: 0)
         }
-        updateStatus()
+    }
+
+    private func populateOutputPopup(_ popup: NSPopUpButton, selectedUID: String?) {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "System Default", action: nil, keyEquivalent: ""))
+        for device in outputDevices {
+            menu.addItem(NSMenuItem(title: device.name, action: nil, keyEquivalent: ""))
+        }
+        popup.menu = menu
+        if let selectedUID, let index = outputDevices.firstIndex(where: { $0.uid == selectedUID }) {
+            popup.selectItem(at: index + 1)
+        } else {
+            popup.selectItem(at: 0)
+        }
     }
 
     @objc private func microphoneChanged() {
@@ -2004,9 +2290,29 @@ final class SettingsViewController: NSViewController {
         updateStatus(announce: true)
     }
 
+    @objc private func sfxOutputChanged() {
+        AudioOutputPreference.setUID(selectedOutputUID(sfxOutputPopup), for: .soundEffects)
+        updateStatus(announce: true)
+    }
+
+    @objc private func callOutputChanged() {
+        AudioOutputPreference.setUID(selectedOutputUID(callOutputPopup), for: .calls)
+        updateStatus(announce: true)
+    }
+
+    /// nil for "System Default" (item 0), else the chosen output device's stable UID. Recording
+    /// a preference only — never opens the device or changes the macOS system output.
+    private func selectedOutputUID(_ popup: NSPopUpButton) -> String? {
+        let index = popup.indexOfSelectedItem
+        guard index > 0, index - 1 < outputDevices.count else { return nil }
+        return outputDevices[index - 1].uid
+    }
+
     private func updateStatus(announce: Bool = false) {
-        let name = microphonePopup.titleOfSelectedItem ?? "System Default"
-        let message = "Voice messages record from: \(name)."
+        let input = microphonePopup.titleOfSelectedItem ?? "System Default"
+        let sfx = sfxOutputPopup.titleOfSelectedItem ?? "System Default"
+        let call = callOutputPopup.titleOfSelectedItem ?? "System Default"
+        let message = "Microphone: \(input). Sound effects play on: \(sfx). Calls play on: \(call)."
         statusLabel.stringValue = message
         statusLabel.setAccessibilityLabel(message)
         if announce {
@@ -2413,6 +2719,54 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
     }
 }
 
+/// Sizing for inline media: scale the intrinsic pixel dimensions down to fit a sensible box
+/// (never upscaling), so a cell reserves the right height before the bytes arrive.
+enum MediaLayout {
+    static let maxWidth: CGFloat = 300
+    static let maxHeight: CGFloat = 300
+
+    static func displaySize(width: Int, height: Int) -> NSSize {
+        let w = CGFloat(max(width, 1))
+        let h = CGFloat(max(height, 1))
+        let scale = min(maxWidth / w, maxHeight / h, 1.0)
+        return NSSize(width: max((w * scale).rounded(), 80), height: max((h * scale).rounded(), 60))
+    }
+}
+
+/// Loads and caches media images by TDLib file id. Downloads go through TDLib (which caches
+/// the bytes on disk); decoded `NSImage`s are held in memory so scrolling never re-downloads
+/// or re-decodes. In-flight loads are coalesced so duplicate cells share one download.
+@MainActor
+final class MediaImageLoader {
+    private let download: @MainActor (Int) async throws -> URL
+    private let cache = NSCache<NSNumber, NSImage>()
+    private var inFlight: [Int: Task<NSImage?, Never>] = [:]
+
+    init(download: @escaping @MainActor (Int) async throws -> URL) {
+        self.download = download
+    }
+
+    func cachedImage(fileID: Int) -> NSImage? {
+        cache.object(forKey: NSNumber(value: fileID))
+    }
+
+    func image(fileID: Int) async -> NSImage? {
+        let key = NSNumber(value: fileID)
+        if let cached = cache.object(forKey: key) { return cached }
+        if let existing = inFlight[fileID] { return await existing.value }
+
+        let task = Task { @MainActor [download] () -> NSImage? in
+            guard let url = try? await download(fileID) else { return nil }
+            return NSImage(contentsOf: url)
+        }
+        inFlight[fileID] = task
+        let image = await task.value
+        inFlight[fileID] = nil
+        if let image { cache.setObject(image, forKey: key) }
+        return image
+    }
+}
+
 final class MessageTableCellView: NSTableCellView {
     private let senderLabel = NSTextField(labelWithString: "")
     private let bodyLabel = NSTextField(wrappingLabelWithString: "")
@@ -2424,8 +2778,24 @@ final class MessageTableCellView: NSTableCellView {
     private let mediaContainer = NSStackView()
     private let mediaIcon = NSImageView()
     private let mediaLabel = NSTextField(labelWithString: "")
+    // Inline image / video poster.
+    private let imageContainer = NSView()
+    private let mediaImageView = NSImageView()
+    private let videoPlayOverlay = NSButton()
+    private let mediaLoadingSpinner = NSProgressIndicator()
+    private let captionLabel = NSTextField(wrappingLabelWithString: "")
+    private var imageWidthConstraint: NSLayoutConstraint?
+    private var imageHeightConstraint: NSLayoutConstraint?
+
     private var accessibilitySummary = ""
     private var isVoiceMessage = false
+    /// File id whose image this cell currently wants, so a late async load for a superseded
+    /// configuration is ignored.
+    private var pendingImageFileID: Int?
+    private var videoToPlay: VideoMedia?
+    private var onPlayVideo: ((VideoMedia) -> Void)?
+    private var onPlayVoiceMessage: (() -> Void)?
+    private weak var imageLoader: MediaImageLoader?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2436,39 +2806,159 @@ final class MessageTableCellView: NSTableCellView {
         nil
     }
 
-    func configure(message: Message, onPlayVoiceMessage: @escaping () -> Void) {
+    func configure(
+        message: Message,
+        imageLoader: MediaImageLoader,
+        onPlayVoiceMessage: @escaping () -> Void,
+        onPlayVideo: @escaping (VideoMedia) -> Void
+    ) {
         accessibilitySummary = message.accessibilitySummary
         setAccessibilityLabel(accessibilitySummary)
+        self.imageLoader = imageLoader
         self.onPlayVoiceMessage = onPlayVoiceMessage
+        self.onPlayVideo = onPlayVideo
+        self.videoToPlay = nil
 
         senderLabel.stringValue = message.isOutgoing ? "You" : message.sender
         timeLabel.stringValue = message.time
         statusLabel.stringValue = message.outgoingStatus?.rawValue ?? ""
         statusLabel.isHidden = !message.isOutgoing || message.outgoingStatus == nil
 
+        // Reset all optional regions; each case re-enables only what it needs.
+        bodyLabel.isHidden = true
+        voiceContainer.isHidden = true
+        mediaContainer.isHidden = true
+        imageContainer.isHidden = true
+        videoPlayOverlay.isHidden = true
+        captionLabel.isHidden = true
+        captionLabel.stringValue = ""   // clear so a recycled cell never keeps a prior caption
+        isVoiceMessage = false
+        pendingImageFileID = nil
+        setImageLoading(false)
+        detachInlineVideo()
+
         switch message.kind {
         case .text(let body):
-            isVoiceMessage = false
             setAccessibilityHelp("Message")
             bodyLabel.stringValue = body
             bodyLabel.isHidden = false
-            voiceContainer.isHidden = true
-            mediaContainer.isHidden = true
         case .voice(let duration, let transcript, _):
             isVoiceMessage = true
             setAccessibilityHelp("Voice message. Press VoiceOver Space to play, pause, or resume.")
-            bodyLabel.isHidden = true
             voiceContainer.isHidden = false
-            mediaContainer.isHidden = true
             voiceTranscriptLabel.stringValue = "Voice message, \(Message.format(duration)). \(transcript)"
+        case .image(let image):
+            setAccessibilityHelp("Image")
+            showImage(fileID: image.fileID, width: image.width, height: image.height, caption: image.caption)
+        case .video(let video):
+            setAccessibilityHelp("Video. Activate to play it inline.")
+            videoToPlay = video
+            showImage(fileID: video.posterFileID, width: video.width, height: video.height, caption: video.caption)
+            videoPlayOverlay.isHidden = false
         case .media(let icon, let label):
-            isVoiceMessage = false
             setAccessibilityHelp("Message")
-            bodyLabel.isHidden = true
-            voiceContainer.isHidden = true
             mediaContainer.isHidden = false
             mediaIcon.image = NSImage(systemSymbolName: icon, accessibilityDescription: nil)
             mediaLabel.stringValue = label
+        }
+    }
+
+    /// Sizes and reveals the image region, then loads the bytes asynchronously. `fileID` is
+    /// optional so a video with no poster still lays out at the right size.
+    private func showImage(fileID: Int?, width: Int, height: Int, caption: String) {
+        imageContainer.isHidden = false
+        let size = MediaLayout.displaySize(width: width, height: height)
+        imageWidthConstraint?.constant = size.width
+        imageHeightConstraint?.constant = size.height
+        mediaImageView.image = nil
+
+        if !caption.isEmpty {
+            captionLabel.isHidden = false
+            captionLabel.stringValue = caption
+        }
+
+        guard let fileID else { return }
+        if let cached = imageLoader?.cachedImage(fileID: fileID) {
+            setLoadedImage(cached)
+            return
+        }
+        // Show a spinner over a neutral fill while the bytes download, so a loading cell is
+        // never mistaken for a fully-rendered (very light or very dark) image.
+        setImageLoading(true)
+        pendingImageFileID = fileID
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let image = await self.imageLoader?.image(fileID: fileID)
+            guard self.pendingImageFileID == fileID else { return }  // superseded by a later configure
+            if let image {
+                self.setLoadedImage(image)
+            } else {
+                self.setImageLoading(false)  // download failed; drop the spinner
+            }
+        }
+    }
+
+    /// Toggles the loading state: a spinner over a neutral placeholder fill while bytes load.
+    private func setImageLoading(_ loading: Bool) {
+        mediaImageView.layer?.backgroundColor = (loading ? NSColor.quaternaryLabelColor : NSColor.clear).cgColor
+        mediaLoadingSpinner.isHidden = !loading
+        if loading {
+            mediaLoadingSpinner.startAnimation(nil)
+        } else {
+            mediaLoadingSpinner.stopAnimation(nil)
+        }
+    }
+
+    /// Installs a decoded image and clears the placeholder — a transparent sticker then renders
+    /// over the cell background rather than a grey box, and a finished load reads as finished.
+    private func setLoadedImage(_ image: NSImage) {
+        mediaImageView.image = image
+        setImageLoading(false)
+    }
+
+    /// Embeds the conversation's shared inline video player over the poster (the player is owned
+    /// by the view controller and moved between cells as rows recycle).
+    func attachInlineVideo(_ playerView: NSView) {
+        playerView.translatesAutoresizingMaskIntoConstraints = false
+        if playerView.superview !== imageContainer {
+            playerView.removeFromSuperview()
+            imageContainer.addSubview(playerView)
+            NSLayoutConstraint.activate([
+                playerView.leadingAnchor.constraint(equalTo: mediaImageView.leadingAnchor),
+                playerView.trailingAnchor.constraint(equalTo: mediaImageView.trailingAnchor),
+                playerView.topAnchor.constraint(equalTo: mediaImageView.topAnchor),
+                playerView.bottomAnchor.constraint(equalTo: mediaImageView.bottomAnchor)
+            ])
+        }
+        mediaImageView.isHidden = true
+        videoPlayOverlay.isHidden = true
+        setVideoDownloading(false)
+    }
+
+    private func detachInlineVideo() {
+        for subview in imageContainer.subviews where subview is AVPlayerView {
+            subview.removeFromSuperview()
+        }
+        mediaImageView.isHidden = false
+    }
+
+    /// Removes the inline player and brings the poster (and, for a video, the play overlay) back,
+    /// so a stopped/switched video never leaves an empty cell.
+    func detachInlineVideoAndRestorePoster() {
+        detachInlineVideo()
+        setVideoDownloading(false)
+        videoPlayOverlay.isHidden = (videoToPlay == nil)
+    }
+
+    /// Shows a spinner over the (already-loaded) poster while the full video downloads, so a slow
+    /// download reads as "loading", not "broken". The play overlay is hidden while downloading.
+    func setVideoDownloading(_ downloading: Bool) {
+        mediaLoadingSpinner.isHidden = !downloading
+        if downloading {
+            mediaLoadingSpinner.startAnimation(nil)
+            videoPlayOverlay.isHidden = true
+        } else {
+            mediaLoadingSpinner.stopAnimation(nil)
         }
     }
 
@@ -2527,6 +3017,65 @@ final class MessageTableCellView: NSTableCellView {
         voiceContainer.addArrangedSubview(voiceTranscriptLabel)
         voiceContainer.setAccessibilityElement(false)
 
+        // Inline image / video poster, with a play overlay centered on top for video. The
+        // background is clear by default (set to a neutral fill only while loading) so a loaded
+        // image — including a transparent sticker — renders cleanly without a grey box behind it.
+        mediaImageView.imageScaling = .scaleProportionallyUpOrDown
+        mediaImageView.wantsLayer = true
+        mediaImageView.layer?.cornerRadius = 10
+        mediaImageView.layer?.masksToBounds = true
+        mediaImageView.layer?.backgroundColor = NSColor.clear.cgColor
+        mediaImageView.translatesAutoresizingMaskIntoConstraints = false
+        mediaImageView.setAccessibilityElement(false)
+
+        mediaLoadingSpinner.style = .spinning
+        mediaLoadingSpinner.controlSize = .small
+        mediaLoadingSpinner.isDisplayedWhenStopped = false
+        mediaLoadingSpinner.isHidden = true
+        mediaLoadingSpinner.translatesAutoresizingMaskIntoConstraints = false
+        mediaLoadingSpinner.setAccessibilityElement(false)
+
+        videoPlayOverlay.image = NSImage(systemSymbolName: "play.circle.fill", accessibilityDescription: "Play video")
+        videoPlayOverlay.symbolConfiguration = .init(pointSize: 44, weight: .regular)
+        videoPlayOverlay.isBordered = false
+        videoPlayOverlay.bezelStyle = .regularSquare
+        videoPlayOverlay.contentTintColor = .white
+        videoPlayOverlay.target = self
+        videoPlayOverlay.action = #selector(playVideo)
+        videoPlayOverlay.translatesAutoresizingMaskIntoConstraints = false
+        videoPlayOverlay.setAccessibilityElement(false)
+
+        imageContainer.translatesAutoresizingMaskIntoConstraints = false
+        imageContainer.addSubview(mediaImageView)
+        imageContainer.addSubview(mediaLoadingSpinner)
+        imageContainer.addSubview(videoPlayOverlay)
+        imageContainer.setAccessibilityElement(false)
+
+        let imageWidth = mediaImageView.widthAnchor.constraint(equalToConstant: 200)
+        let imageHeight = mediaImageView.heightAnchor.constraint(equalToConstant: 200)
+        imageWidthConstraint = imageWidth
+        imageHeightConstraint = imageHeight
+        NSLayoutConstraint.activate([
+            mediaImageView.leadingAnchor.constraint(equalTo: imageContainer.leadingAnchor),
+            mediaImageView.topAnchor.constraint(equalTo: imageContainer.topAnchor),
+            mediaImageView.bottomAnchor.constraint(equalTo: imageContainer.bottomAnchor),
+            mediaImageView.trailingAnchor.constraint(lessThanOrEqualTo: imageContainer.trailingAnchor),
+            imageWidth,
+            imageHeight,
+            mediaLoadingSpinner.centerXAnchor.constraint(equalTo: mediaImageView.centerXAnchor),
+            mediaLoadingSpinner.centerYAnchor.constraint(equalTo: mediaImageView.centerYAnchor),
+            videoPlayOverlay.centerXAnchor.constraint(equalTo: mediaImageView.centerXAnchor),
+            videoPlayOverlay.centerYAnchor.constraint(equalTo: mediaImageView.centerYAnchor)
+        ])
+
+        captionLabel.font = .systemFont(ofSize: 13)
+        captionLabel.maximumNumberOfLines = 0
+        captionLabel.lineBreakMode = .byWordWrapping
+        captionLabel.preferredMaxLayoutWidth = 300
+        captionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        captionLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        captionLabel.setAccessibilityElement(false)
+
         mediaIcon.symbolConfiguration = .init(pointSize: 20, weight: .regular)
         mediaIcon.contentTintColor = .controlAccentColor
         mediaIcon.setAccessibilityElement(false)
@@ -2543,11 +3092,11 @@ final class MessageTableCellView: NSTableCellView {
         mediaContainer.addArrangedSubview(mediaLabel)
         mediaContainer.setAccessibilityElement(false)
 
-        let stack = NSStackView(views: [senderLabel, bodyLabel, voiceContainer, mediaContainer, metadataStack])
+        let stack = NSStackView(views: [senderLabel, bodyLabel, voiceContainer, imageContainer, captionLabel, mediaContainer, metadataStack])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 5
-        stack.edgeInsets = NSEdgeInsets(top: 10, left: 14, bottom: 10, right: 14)
+        stack.spacing = 4
+        stack.edgeInsets = NSEdgeInsets(top: 5, left: 14, bottom: 5, right: 14)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(stack)
@@ -2564,144 +3113,24 @@ final class MessageTableCellView: NSTableCellView {
     }
 
     override func accessibilityPerformPress() -> Bool {
-        guard isVoiceMessage else { return false }
-        onPlayVoiceMessage?()
-        return true
+        if isVoiceMessage {
+            onPlayVoiceMessage?()
+            return true
+        }
+        if let videoToPlay {
+            onPlayVideo?(videoToPlay)
+            return true
+        }
+        return false
     }
 
     @objc private func playVoiceMessage() {
         onPlayVoiceMessage?()
     }
 
-    private var onPlayVoiceMessage: (() -> Void)?
-}
-
-final class MessageBubbleView: NSView {
-    private let message: Message
-
-    init(message: Message) {
-        self.message = message
-        super.init(frame: .zero)
-        setup()
-    }
-
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    private func setup() {
-        wantsLayer = true
-        layer?.cornerRadius = 12
-        layer?.backgroundColor = (message.isOutgoing ? NSColor.controlAccentColor.withAlphaComponent(0.22) : NSColor.controlBackgroundColor).cgColor
-        setAccessibilityElement(true)
-        setAccessibilityRole(.group)
-        setAccessibilityLabel(message.accessibilitySummary)
-        setAccessibilityHelp("A chat message. Use VoiceOver left or right to move between messages.")
-
-        let sender = NSTextField(labelWithString: message.isOutgoing ? "You" : message.sender)
-        sender.font = .systemFont(ofSize: 12, weight: .semibold)
-        sender.textColor = .secondaryLabelColor
-        sender.setAccessibilityElement(false)
-
-        let bodyView: NSView
-        switch message.kind {
-        case .text(let body):
-            let text = NSTextField(wrappingLabelWithString: body)
-            text.font = .systemFont(ofSize: 14)
-            text.maximumNumberOfLines = 0
-            text.setAccessibilityElement(false)
-            bodyView = text
-        case .voice(let duration, let transcript, _):
-            bodyView = VoiceMessageView(duration: duration, transcript: transcript)
-            bodyView.setAccessibilityElement(false)
-        case .media(let icon, let label):
-            let iconView = NSImageView(image: NSImage(systemSymbolName: icon, accessibilityDescription: nil) ?? NSImage())
-            iconView.contentTintColor = .controlAccentColor
-            let text = NSTextField(labelWithString: label)
-            text.font = .systemFont(ofSize: 14)
-            text.lineBreakMode = .byTruncatingTail
-            let row = NSStackView(views: [iconView, text])
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.spacing = 6
-            row.setAccessibilityElement(false)
-            bodyView = row
-        }
-
-        let time = NSTextField(labelWithString: message.time)
-        time.font = .systemFont(ofSize: 11)
-        time.textColor = .tertiaryLabelColor
-        time.setAccessibilityElement(false)
-
-        let stack = NSStackView(views: [sender, bodyView, time])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 6
-        stack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
-            stack.topAnchor.constraint(equalTo: topAnchor),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
-        ])
-    }
-}
-
-final class VoiceMessageView: NSView {
-    init(duration: TimeInterval, transcript: String) {
-        super.init(frame: .zero)
-        setup(duration: duration, transcript: transcript)
-    }
-
-    required init?(coder: NSCoder) {
-        nil
-    }
-
-    private func setup(duration: TimeInterval, transcript: String) {
-        let playButton = NSButton(image: NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play voice message") ?? NSImage(), target: nil, action: nil)
-        playButton.bezelStyle = .texturedRounded
-        playButton.setAccessibilityElement(false)
-
-        let progress = NSProgressIndicator()
-        progress.isIndeterminate = false
-        progress.minValue = 0
-        progress.maxValue = duration
-        progress.doubleValue = 0
-        progress.controlSize = .small
-        progress.setAccessibilityElement(false)
-
-        let durationLabel = NSTextField(labelWithString: Message.format(duration))
-        durationLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        durationLabel.textColor = .secondaryLabelColor
-        durationLabel.setAccessibilityElement(false)
-
-        let row = NSStackView(views: [playButton, progress, durationLabel])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
-
-        let transcriptLabel = NSTextField(wrappingLabelWithString: transcript)
-        transcriptLabel.font = .systemFont(ofSize: 13)
-        transcriptLabel.textColor = .secondaryLabelColor
-        transcriptLabel.setAccessibilityElement(false)
-
-        let stack = NSStackView(views: [row, transcriptLabel])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 6
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
-            stack.topAnchor.constraint(equalTo: topAnchor),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
-            progress.widthAnchor.constraint(equalToConstant: 180)
-        ])
+    @objc private func playVideo() {
+        guard let videoToPlay else { return }
+        onPlayVideo?(videoToPlay)
     }
 }
 

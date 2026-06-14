@@ -205,13 +205,22 @@ struct TDLibConfiguration {
 
 enum TDLibTelegramClientError: LocalizedError {
     case clientNotStarted
+    case notAPrivateChat
 
     var errorDescription: String? {
         switch self {
         case .clientNotStarted:
             return "TDLib client has not been started."
+        case .notAPrivateChat:
+            return "Calls are only supported in one-to-one chats."
         }
     }
+}
+
+/// The call protocol CocoGram advertises during signaling. (The media engine consumes the
+/// negotiated connection params from `callStateReady`.)
+private func cocogramCallProtocol() -> CallProtocol {
+    CallProtocol(libraryVersions: ["11.0.0"], maxLayer: 92, minLayer: 65, udpP2p: true, udpReflector: true)
 }
 
 final class TDLibTelegramClient: TelegramClient {
@@ -412,6 +421,10 @@ final class TDLibTelegramClient: TelegramClient {
     }
 
     func downloadVoiceMessage(fileID: Int) async throws -> URL {
+        try await downloadFile(fileID: fileID)
+    }
+
+    func downloadFile(fileID: Int) async throws -> URL {
         let file: TDLibKit.File = try await runTDLibRequest { completion in
             try tdClient.downloadFile(
                 fileId: fileID,
@@ -496,6 +509,116 @@ final class TDLibTelegramClient: TelegramClient {
             }
             throw error
         }
+    }
+
+    // MARK: - Calls (signaling)
+
+    func startCall(chatID: Int64, isVideo: Bool) async throws {
+        let chat = try await fetchChat(id: chatID)
+        guard case .chatTypePrivate(let priv) = chat.type else {
+            throw TDLibTelegramClientError.notAPrivateChat
+        }
+        let _: CallId = try await runTDLibRequest { completion in
+            try tdClient.createCall(isVideo: isVideo, protocol: cocogramCallProtocol(), userId: priv.userId, completion: completion)
+        }
+    }
+
+    func acceptCall(callID: Int) async throws {
+        let _: Ok = try await runTDLibRequest { completion in
+            try tdClient.acceptCall(callId: callID, protocol: cocogramCallProtocol(), completion: completion)
+        }
+    }
+
+    func discardCall(callID: Int, isVideo: Bool) async throws {
+        let _: Ok = try await runTDLibRequest { completion in
+            try tdClient.discardCall(
+                callId: callID, connectionId: 0, duration: 0,
+                inviteLink: "", isDisconnected: false, isVideo: isVideo, completion: completion
+            )
+        }
+    }
+
+    func sendCallSignalingData(callID: Int, data: Data) async throws {
+        let _: Ok = try await runTDLibRequest { completion in
+            try tdClient.sendCallSignalingData(callId: callID, data: data, completion: completion)
+        }
+    }
+
+    private func mapCall(_ call: TDLibKit.Call) async -> CocoCall {
+        CocoCall(
+            id: call.id,
+            userID: call.userId,
+            isOutgoing: call.isOutgoing,
+            isVideo: call.isVideo,
+            state: Self.mapCallState(call.state, isOutgoing: call.isOutgoing),
+            peerName: await userDisplayName(userId: call.userId)
+        )
+    }
+
+    /// Pure TDLib `CallState` → `CocoCallState` mapping (no client needed) so it is unit-testable
+    /// with fabricated structs and never reaches out to place a call.
+    static func mapCallState(_ state: CallState, isOutgoing: Bool) -> CocoCallState {
+        switch state {
+        case .callStatePending(let pending):
+            return .pending(isOutgoing: isOutgoing, isReceived: pending.isReceived)
+        case .callStateExchangingKeys:
+            return .exchangingKeys
+        case .callStateReady(let ready):
+            return .ready(CallConnection(
+                encryptionKey: ready.encryptionKey,
+                config: ready.config,
+                customParameters: ready.customParameters,
+                emojis: ready.emojis,
+                reflectors: mapReflectors(ready.servers)
+            ))
+        case .callStateHangingUp:
+            return .hangingUp
+        case .callStateDiscarded(let discarded):
+            return .discarded(reason: discardReasonText(discarded.reason))
+        case .callStateError(let error):
+            return .failed(error.error.message)
+        }
+    }
+
+    /// Maps TDLib's structured call servers to the reflector relays the media engine can use
+    /// (Telegram-reflector type, with an address and 16-byte peer tag). WebRTC servers are skipped
+    /// — the current engine speaks the reflector protocol.
+    static func mapReflectors(_ servers: [CallServer]) -> [CallReflectorServer] {
+        servers.compactMap { server in
+            guard case .callServerTypeTelegramReflector(let reflector) = server.type,
+                  !server.ipAddress.isEmpty, reflector.peerTag.count == 16,
+                  server.port > 0, server.port <= 65_535 else { return nil }
+            return CallReflectorServer(
+                host: server.ipAddress,
+                port: UInt16(server.port),
+                peerTag: reflector.peerTag,
+                isTcp: reflector.isTcp
+            )
+        }
+    }
+
+    private static func discardReasonText(_ reason: CallDiscardReason) -> String {
+        switch reason {
+        case .callDiscardReasonMissed: return "missed"
+        case .callDiscardReasonDeclined: return "declined"
+        case .callDiscardReasonDisconnected: return "connection lost"
+        case .callDiscardReasonHungUp: return "hung up"
+        case .callDiscardReasonUpgradeToGroupCall: return "moved to a group call"
+        default: return "ended"
+        }
+    }
+
+    private func userDisplayName(userId: Int64) async -> String {
+        if let user = userCache[userId] {
+            return displayName(for: user)
+        }
+        if let user: TDLibKit.User = try? await runTDLibRequest({ completion in
+            try tdClient.getUser(userId: userId, completion: completion)
+        }) {
+            userCache[userId] = user
+            return displayName(for: user)
+        }
+        return "User \(userId)"
     }
 
     private var tdClient: TDLibClient {
@@ -596,11 +719,11 @@ final class TDLibTelegramClient: TelegramClient {
         return best
     }
 
-    private func getChatHistory(chatID: Int64, limit: Int, onlyLocal: Bool) async throws -> [TDLibKit.Message] {
+    private func getChatHistory(chatID: Int64, fromMessageID: Int64 = 0, limit: Int, onlyLocal: Bool) async throws -> [TDLibKit.Message] {
         let result: Messages = try await runTDLibRequest { completion in
             try tdClient.getChatHistory(
                 chatId: chatID,
-                fromMessageId: 0,
+                fromMessageId: fromMessageID,
                 limit: limit,
                 offset: 0,
                 onlyLocal: onlyLocal,
@@ -608,6 +731,34 @@ final class TDLibTelegramClient: TelegramClient {
             )
         }
         return result.messages ?? []
+    }
+
+    /// Loads the page of history immediately older than `beforeMessageID` for scroll-back.
+    /// `getChatHistory` anchored at an older id is offline-first like the recent-history load,
+    /// so the first call may return only the anchor (or nothing) while a server fetch lands;
+    /// poll briefly until older messages appear or the budget is spent (start of history).
+    func loadOlderMessages(chatID: Int64, beforeMessageID: Int64) async throws -> [Message] {
+        var older: [TDLibKit.Message] = []
+        for attempt in 0..<Self.maxHistoryPolls {
+            if Task.isCancelled { break }
+            let batch = (try? await getChatHistory(
+                chatID: chatID, fromMessageID: beforeMessageID,
+                limit: Self.recentHistoryLimit, onlyLocal: false
+            )) ?? []
+            // getChatHistory at offset 0 includes the anchor message itself; keep only older.
+            older = batch.filter { $0.id < beforeMessageID }
+            if !older.isEmpty { break }
+            if attempt < Self.maxHistoryPolls - 1 {
+                try? await Task.sleep(for: .milliseconds(Self.historyPollMilliseconds))
+            }
+        }
+
+        let chat = try? await loadChat(id: chatID)
+        var mapped: [Message] = []
+        for tdMessage in older.reversed() {  // oldest-first for prepending above current history
+            mapped.append(await mapMessage(tdMessage, in: chat))
+        }
+        return mapped
     }
 
     fileprivate func handleUpdateData(_ data: Data, client: TDLibClient) {
@@ -661,6 +812,14 @@ final class TDLibTelegramClient: TelegramClient {
             if update.file.remote.isUploadingCompleted {
                 removePendingVoiceUpload(fileID: update.file.id)
             }
+        case .updateCall(let update):
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let call = await mapCall(update.call)
+                continuation.yield(.callChanged(call))
+            }
+        case .updateNewCallSignalingData(let update):
+            continuation.yield(.callSignalingData(callID: update.callId, data: update.data))
         default:
             break
         }
@@ -886,6 +1045,7 @@ final class TDLibTelegramClient: TelegramClient {
 
     private func mapMessage(_ tdMessage: TDLibKit.Message, in chat: TDLibKit.Chat? = nil) async -> Message {
         Message(
+            id: tdMessage.id,
             sender: await senderName(for: tdMessage),
             time: formatDate(tdMessage.date),
             isOutgoing: tdMessage.isOutgoing,
@@ -905,10 +1065,92 @@ final class TDLibTelegramClient: TelegramClient {
                 transcript: transcript,
                 fileID: voiceNote.voiceNote.voice.id
             )
+        case .messagePhoto(let photo):
+            return photoKind(photo)
+        case .messageSticker(let sticker):
+            return stickerKind(sticker)
+        case .messageVideo(let video):
+            return videoKind(video)
+        case .messageAnimation(let animation):
+            return animationKind(animation)
         default:
             let summary = mediaSummary(content)
             return .media(icon: summary.icon, label: summary.label)
         }
+    }
+
+    private func captionedLabel(_ base: String, _ caption: FormattedText) -> String {
+        caption.text.isEmpty ? base : "\(base) — \(caption.text)"
+    }
+
+    private func photoKind(_ photo: MessagePhoto) -> MessageKind {
+        // TDLib returns several sizes smallest→largest; the last (largest) is the full image.
+        guard let size = photo.photo.sizes.max(by: { $0.width * $0.height < $1.width * $1.height }) else {
+            return .media(icon: "photo", label: captionedLabel("Photo", photo.caption))
+        }
+        return .image(ImageMedia(
+            fileID: size.photo.id,
+            width: size.width,
+            height: size.height,
+            caption: photo.caption.text,
+            accessibilityLabel: captionedLabel("Photo", photo.caption)
+        ))
+    }
+
+    private func stickerKind(_ message: MessageSticker) -> MessageKind {
+        let sticker = message.sticker
+        let label = sticker.emoji.isEmpty ? "Sticker" : "Sticker \(sticker.emoji)"
+        // A WEBP sticker is a still image AppKit can decode directly. Animated stickers (TGS,
+        // a gzipped Lottie) and video stickers (WEBM) can't be rendered as a frame here, so
+        // fall back to their static thumbnail — still real media, not a stand-in glyph.
+        if case .stickerFormatWebp = sticker.format {
+            return .image(ImageMedia(
+                fileID: sticker.sticker.id,
+                width: sticker.width,
+                height: sticker.height,
+                caption: "",
+                accessibilityLabel: label
+            ))
+        }
+        if let thumbnail = sticker.thumbnail {
+            return .image(ImageMedia(
+                fileID: thumbnail.file.id,
+                width: thumbnail.width,
+                height: thumbnail.height,
+                caption: "",
+                accessibilityLabel: label
+            ))
+        }
+        return .media(icon: "face.smiling", label: label)
+    }
+
+    private func videoKind(_ message: MessageVideo) -> MessageKind {
+        let video = message.video
+        let base = "Video, \(Message.format(TimeInterval(video.duration)))"
+        return .video(VideoMedia(
+            videoFileID: video.video.id,
+            posterFileID: video.thumbnail?.file.id,
+            width: video.width,
+            height: video.height,
+            duration: TimeInterval(video.duration),
+            caption: message.caption.text,
+            accessibilityLabel: captionedLabel(base, message.caption)
+        ))
+    }
+
+    private func animationKind(_ message: MessageAnimation) -> MessageKind {
+        // GIFs are silent looping videos. The official app autoplays them; per the requirement
+        // that videos never autoplay, render the poster and play on demand like any video.
+        let animation = message.animation
+        return .video(VideoMedia(
+            videoFileID: animation.animation.id,
+            posterFileID: animation.thumbnail?.file.id,
+            width: animation.width,
+            height: animation.height,
+            duration: TimeInterval(animation.duration),
+            caption: message.caption.text,
+            accessibilityLabel: captionedLabel("GIF", message.caption)
+        ))
     }
 
     private func messagePreview(_ message: TDLibKit.Message?) -> String {

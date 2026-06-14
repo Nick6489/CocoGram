@@ -9,6 +9,12 @@ final class DummyTelegramClient: TelegramClient {
     private let contacts: [Contact]
     private let channels: [Channel]
     private let calls: [CallRecord]
+    private var lastOutgoingID: Int64 = 1000
+
+    private func nextOutgoingID() -> Int64 {
+        lastOutgoingID += 1
+        return lastOutgoingID
+    }
 
     init() {
         let stream = AsyncStream<TelegramUpdate>.makeStream()
@@ -47,17 +53,17 @@ final class DummyTelegramClient: TelegramClient {
 
         messagesByChatID = [
             1: [
-                Message(sender: "Maya", time: "9:31 AM", isOutgoing: false, kind: .text("Can we make the first-run flow friendly for VoiceOver from day one?"), outgoingStatus: nil),
-                Message(sender: "Maya", time: "9:33 AM", isOutgoing: false, kind: .voice(duration: 42, transcript: "I walked through the contact picker and the order feels right. The compose field should announce attachment state.", fileID: nil), outgoingStatus: nil),
-                Message(sender: "You", time: "9:38 AM", isOutgoing: true, kind: .text("Yes. I am adding labels and actions directly to the controls instead of treating accessibility as a pass at the end."), outgoingStatus: .read)
+                Message(id: 101, sender: "Maya", time: "9:31 AM", isOutgoing: false, kind: .text("Can we make the first-run flow friendly for VoiceOver from day one?"), outgoingStatus: nil),
+                Message(id: 102, sender: "Maya", time: "9:33 AM", isOutgoing: false, kind: .voice(duration: 42, transcript: "I walked through the contact picker and the order feels right. The compose field should announce attachment state.", fileID: nil), outgoingStatus: nil),
+                Message(id: 103, sender: "You", time: "9:38 AM", isOutgoing: true, kind: .text("Yes. I am adding labels and actions directly to the controls instead of treating accessibility as a pass at the end."), outgoingStatus: .read)
             ],
             2: [
-                Message(sender: "Sam", time: "Yesterday", isOutgoing: false, kind: .text("The UI can use fake chat identifiers for now. We will swap the source after TDLib client setup."), outgoingStatus: nil),
-                Message(sender: "You", time: "Yesterday", isOutgoing: true, kind: .text("Great. I will keep the model shape close to Telegram concepts."), outgoingStatus: .delivered)
+                Message(id: 201, sender: "Sam", time: "Yesterday", isOutgoing: false, kind: .text("The UI can use fake chat identifiers for now. We will swap the source after TDLib client setup."), outgoingStatus: nil),
+                Message(id: 202, sender: "You", time: "Yesterday", isOutgoing: true, kind: .text("Great. I will keep the model shape close to Telegram concepts."), outgoingStatus: .delivered)
             ],
             3: [
-                Message(sender: "Nico", time: "Monday", isOutgoing: false, kind: .text("Call me after dinner?"), outgoingStatus: nil),
-                Message(sender: "You", time: "Monday", isOutgoing: true, kind: .text("Absolutely."), outgoingStatus: .sent)
+                Message(id: 301, sender: "Nico", time: "Monday", isOutgoing: false, kind: .text("Call me after dinner?"), outgoingStatus: nil),
+                Message(id: 302, sender: "You", time: "Monday", isOutgoing: true, kind: .text("Absolutely."), outgoingStatus: .sent)
             ]
         ]
 
@@ -102,6 +108,10 @@ final class DummyTelegramClient: TelegramClient {
         messagesByChatID[chatID, default: []]
     }
 
+    func loadOlderMessages(chatID: Int64, beforeMessageID: Int64) async throws -> [Message] {
+        []  // The sample data has no history older than what loadMessages returns.
+    }
+
     func loadContacts() async throws -> [Contact] {
         contacts
     }
@@ -118,8 +128,18 @@ final class DummyTelegramClient: TelegramClient {
         throw CocoaError(.fileNoSuchFile)
     }
 
+    func downloadFile(fileID: Int) async throws -> URL {
+        throw CocoaError(.fileNoSuchFile)
+    }
+
+    // Calls are not simulated in dummy mode.
+    func startCall(chatID: Int64, isVideo: Bool) async throws {}
+    func acceptCall(callID: Int) async throws {}
+    func discardCall(callID: Int, isVideo: Bool) async throws {}
+    func sendCallSignalingData(callID: Int, data: Data) async throws {}
+
     func sendText(_ text: String, chatID: Int64) async throws -> Message {
-        let message = Message(sender: "You", time: "Just now", isOutgoing: true, kind: .text(text), outgoingStatus: .sent)
+        let message = Message(id: nextOutgoingID(), sender: "You", time: "Just now", isOutgoing: true, kind: .text(text), outgoingStatus: .sent)
         messagesByChatID[chatID, default: []].append(message)
         continuation.yield(.messagesChanged(chatID: chatID, messages: [message]))
         return message
@@ -128,6 +148,7 @@ final class DummyTelegramClient: TelegramClient {
     func sendVoiceMessage(fileURL: URL, duration: TimeInterval, chatID: Int64) async throws -> Message {
         try? FileManager.default.removeItem(at: fileURL)
         let message = Message(
+            id: nextOutgoingID(),
             sender: "You",
             time: "Just now",
             isOutgoing: true,

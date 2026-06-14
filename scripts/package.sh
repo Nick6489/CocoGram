@@ -82,13 +82,33 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# ---- 4. Icon -----------------------------------------------------------------------
-say "Generating placeholder app icon"
+# ---- 4. Icon (ALWAYS bundled) ------------------------------------------------------
+# Render a fresh icon from scripts/make_icon.swift; if that fails for any reason, fall back
+# to the committed Resources/AppIcon.icns. Then HARD-VERIFY the icon actually landed in the
+# bundle and is a valid .icns — packaging aborts rather than ship an icon-less app. The
+# Info.plist above already declares CFBundleIconFile = AppIcon.
+say "Generating app icon"
+ICON_DST="$RES_DIR/AppIcon.icns"
+ICON_FALLBACK="$ROOT/Resources/AppIcon.icns"
 ICONSET="$DIST/AppIcon.iconset"
 rm -rf "$ICONSET"
-swift "$ROOT/scripts/make_icon.swift" "$ICONSET"
-iconutil -c icns "$ICONSET" -o "$RES_DIR/AppIcon.icns"
+if swift "$ROOT/scripts/make_icon.swift" "$ICONSET" && iconutil -c icns "$ICONSET" -o "$ICON_DST" 2>/dev/null; then
+    echo "  rendered AppIcon.icns from scripts/make_icon.swift"
+else
+    echo "  WARNING: icon generation failed — falling back to committed icon" >&2
+    [ -f "$ICON_FALLBACK" ] || { echo "ERROR: icon generation failed and no committed fallback at $ICON_FALLBACK" >&2; exit 1; }
+    cp "$ICON_FALLBACK" "$ICON_DST"
+fi
 rm -rf "$ICONSET"
+
+# Always-bundled guarantee: the icon must exist, be non-empty, and be a real .icns.
+[ -s "$ICON_DST" ] || { echo "ERROR: app icon missing from bundle at $ICON_DST" >&2; exit 1; }
+if ! iconutil -c iconset "$ICON_DST" -o "$DIST/.icon-verify.iconset" >/dev/null 2>&1; then
+    echo "ERROR: bundled AppIcon.icns is not a valid icns" >&2
+    exit 1
+fi
+rm -rf "$DIST/.icon-verify.iconset"
+echo "  app icon bundled at Contents/Resources/AppIcon.icns ($(du -h "$ICON_DST" | cut -f1 | tr -d ' '))"
 
 # ---- 4b. Bundle UI sound effects ---------------------------------------------------
 # Copied into Resources/Sounds BEFORE signing so they are sealed by the app signature
@@ -127,6 +147,19 @@ say "Verifying microphone entitlement is present"
 codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.device.audio-input" \
     && echo "  audio-input entitlement: OK" \
     || { echo "ERROR: audio-input entitlement missing from signed app" >&2; exit 1; }
+
+# ---- 5b. Refresh LaunchServices so the freshly-built app shows its icon -------------
+# Re-register the bundle and bump its mtime so LaunchServices re-reads the just-signed icon
+# rather than a stale record from an earlier build at this same path. NOTE: this does NOT bust
+# a poisoned iconservices RENDER cache from prior builds — if Finder still shows a generic or
+# wrong icon for a path you've rebuilt many times, clear the icon cache once (see README/run):
+#   sudo rm -rf /Library/Caches/com.apple.iconservices.store && sudo killall iconservicesagent && killall Dock Finder
+# Fresh installs (a new machine, or /Applications) always show the icon correctly.
+say "Refreshing LaunchServices registration"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+[ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
+touch -c "$APP"
+echo "  re-registered with LaunchServices"
 
 if [ "$SKIP_NOTARIZE" = "1" ]; then
     say "SKIP_NOTARIZE=1 — stopping after sign. App at: $APP"

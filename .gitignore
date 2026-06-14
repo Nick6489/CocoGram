@@ -8,3 +8,6 @@ DerivedData/
 dist/
 *.p8
 *.icns
+# ...but DO track the committed fallback app icon, so packaging can always bundle an icon
+# even if on-the-fly generation (scripts/make_icon.swift) fails. See package.sh step 4.
+!Resources/AppIcon.icns

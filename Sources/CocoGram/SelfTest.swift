@@ -1,3 +1,5 @@
+import AppKit
+import AVFoundation
 import Foundation
 
 /// Headless diagnostics, gated behind an env var and run *before* any GUI/`app.run()`.
@@ -16,18 +18,176 @@ enum SelfTest {
             runTDLibDiagnostic()
             exit(0)
         }
+        if ProcessInfo.processInfo.environment["COCOGRAM_SELFTEST_RENDER"] == "1" {
+            runRenderTest()
+            exit(0)
+        }
+        if ProcessInfo.processInfo.environment["COCOGRAM_SELFTEST_AUDIO"] == "1" {
+            runAudioDeviceTest()
+            exit(0)
+        }
+        if ProcessInfo.processInfo.environment["COCOGRAM_SELFTEST_MEDIA"] == "1" {
+            runMediaEngineLoopbackTest()
+            exit(0)
+        }
+        if ProcessInfo.processInfo.environment["COCOGRAM_SELFTEST_CALL"] == "1" {
+            MainActor.assumeIsolated { CallSelfTest.run() }  // runs on the main thread, before app.run()
+            exit(0)
+        }
     }
 
-    private static func log(_ s: String) { FileHandle.standardError.write(Data("[selftest] \(s)\n".utf8)) }
+    /// Drives the full call media pipeline through a local UDP loopback — capture-format PCM →
+    /// Opus → per-call AES-IGE encryption → reflector framing → UDP(127.0.0.1) → deframe →
+    /// decrypt → Opus → PCM — and verifies the audio survives, plus crypto integrity, direction
+    /// separation, and packet-loss concealment. Opens NO audio device and places NO call (the
+    /// PCM is a synthesized sine, the key is a fixed stand-in, the socket talks only to itself).
+    static func runMediaEngineLoopbackTest() {
+        log("--- Call media engine: two-peer local loopback (no devices opened, no call placed) ---")
+        do {
+            let callKey = (0..<256).map { UInt8($0 & 0xFF) }          // stands in for encryption_key
+            let peerTag = (0..<16).map { UInt8(0xA0 + ($0 & 0x0F)) }  // 16-byte reflector routing tag
+            // Two pipelines sharing the call key, as the two ends of a real call: a caller
+            // (seals x=0) and a callee (opens incoming with x=0). This is the live engine's code.
+            let caller = try CallMediaPipeline(callKey: callKey, peerTag: peerTag, isOutgoing: true)
+            let callee = try CallMediaPipeline(callKey: callKey, peerTag: peerTag, isOutgoing: false)
 
-    /// Connects to the real, signed-in TDLib session read-only and prints a report on the
-    /// two reported bugs (chats showing only the latest message; the initial-sync sound-effect
-    /// flood). Runs entirely before `app.run()`, never opens a window or activates the app,
-    /// and closes TDLib cleanly so the session database is flushed (never corrupted). The
-    /// session is reused, never re-authenticated — see SESSION_PERSISTENCE_INVARIANT.md.
-    static func runTDLibDiagnostic() {
+            let transport = try CallUDPTransport()
+            let port = try transport.bind()
+            log("UDP bound to 127.0.0.1:\(port)")
+
+            var phase = 0.0
+            func sineFrame() -> [Int16] {
+                let step = 2.0 * Double.pi * 440.0 / 48_000.0
+                return (0..<960).map { _ in
+                    defer { phase += step }
+                    return Int16(sin(phase) * 12_000)
+                }
+            }
+
+            var lastIn: [Int16] = []
+            var lastOut: [Int16] = []
+            var pcmBytes = 0, wireBytes = 0
+            // Prime ~0.5 s, then measure the last (steady-state) frame: caller → wire → callee.
+            for _ in 0..<25 {
+                let inFrame = sineFrame()
+                let wire = try caller.packetize(frame: inFrame)
+                try transport.send(wire, host: "127.0.0.1", port: port)
+                guard let received = transport.receiveOnce(timeoutMilliseconds: 500) else {
+                    log("LOOPBACK: no datagram received ✗"); transport.close(); return
+                }
+                lastIn = inFrame
+                lastOut = try callee.depacketize(wire: received)
+                pcmBytes = inFrame.count * 2; wireBytes = wire.count
+            }
+
+            func rms(_ f: [Int16]) -> Double {
+                f.isEmpty ? 0 : sqrt(f.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(f.count))
+            }
+            let inRMS = rms(lastIn), outRMS = rms(lastOut)
+            let ratio = inRMS > 0 ? outRMS / inRMS : 0
+            let carriesAudio = outRMS > 500 && ratio > 0.3 && ratio < 3.0
+            log("pipeline: PCM \(pcmBytes)B → wire \(wireBytes)B (peer_tag 16 + msg_key 16 + AES-IGE(opus))")
+            log("audio survived caller→callee: inRMS=\(Int(inRMS)) outRMS=\(Int(outRMS)) ratio=\(String(format: "%.2f", ratio)) → \(carriesAudio ? "PASS ✓" : "FAIL ✗")")
+
+            // Crypto integrity: a tampered packet must be rejected by the callee.
+            var tampered = try caller.packetize(frame: sineFrame())
+            tampered[tampered.count - 1] ^= 0xFF
+            var integrityHeld = false
+            do { _ = try callee.depacketize(wire: tampered) } catch { integrityHeld = true }
+            log("crypto integrity: tampered packet rejected = \(integrityHeld ? "PASS ✓" : "FAIL ✗")")
+
+            // Direction separation: a caller packet must NOT open as if it were the callee's own
+            // outgoing (a second caller pipeline opens incoming with x=8 and should fail).
+            let crossed = try CallMediaPipeline(callKey: callKey, peerTag: peerTag, isOutgoing: true)
+            var directionsSeparate = false
+            do { _ = try crossed.depacketize(wire: try caller.packetize(frame: sineFrame())) }
+            catch { directionsSeparate = true }
+            log("crypto direction: caller packet not decryptable in the caller's receive direction = \(directionsSeparate ? "PASS ✓" : "FAIL ✗")")
+
+            // Packet-loss concealment: a lost frame yields a synthesized frame, not a crash.
+            let concealed = try callee.conceal()
+            log("packet-loss concealment: produced \(concealed.count)-sample frame = \(concealed.count == 960 ? "PASS ✓" : "FAIL ✗")")
+
+            transport.close()
+            log("media loopback complete.")
+        } catch {
+            log("media loopback FAILED: \(error)")
+        }
+    }
+
+    /// Verifies the audio-output pieces with NO TDLib, NO call, and WITHOUT opening any device for
+    /// IO: output-device enumeration, SFX `currentDevice` routing (configured, never played), and
+    /// the CoreAudio aggregate device (created, inspected via property reads, destroyed). Creating
+    /// an aggregate does not start an IOProc, so no mic is woken and no Bluetooth device flips to
+    /// HFP — see CallAudioAggregate's doc and the header rule above.
+    static func runAudioDeviceTest() {
+        log("--- Audio output devices ---")
+        let outputs = CoreAudioDevices.availableOutputDevices()
+        log("\(outputs.count) output device(s):")
+        for device in outputs { log("  • \(device.name)  (uid \(device.uid))") }
+        log("Sound-effects output preference: \(AudioOutputPreference.uid(for: .soundEffects) ?? "(System Default)")")
+        log("Call output preference: \(AudioOutputPreference.uid(for: .calls) ?? "(System Default)")")
+
+        // SFX routing: an AVAudioPlayer accepts a device UID via `currentDevice`. Assigning it
+        // configures routing WITHOUT opening the device — we never call play().
+        if let url = Bundle.module.url(forResource: "Send Message", withExtension: "m4a", subdirectory: "Sounds"),
+           let player = try? AVAudioPlayer(contentsOf: url) {
+            if let target = outputs.first {
+                player.currentDevice = target.uid
+                let roundTrips = player.currentDevice == target.uid
+                player.currentDevice = nil
+                let clears = player.currentDevice == nil
+                log("SFX routing: currentDevice set to \(target.uid) round-trips=\(roundTrips); clear→default=\(clears) (play() never called)")
+            } else {
+                log("SFX routing: player built OK; no output device available to target.")
+            }
+        } else {
+            log("SFX routing: could not load a sound resource to exercise routing.")
+        }
+
+        // Aggregate device (anti-HFP): build from the real input + call-output preferences,
+        // inspect composition, destroy. Never starts IO.
+        log("--- CoreAudio aggregate device (anti-HFP) ---")
+        guard let plan = CallAudioAggregate.resolvePlan(
+            inputUID: AudioInputPreference.preferredUID,
+            outputUID: AudioOutputPreference.uid(for: .calls)
+        ) else {
+            log("aggregate: no usable input/output pair resolved on this machine.")
+            return
+        }
+        log("plan: input=\"\(plan.inputName)\" + output=\"\(plan.outputName)\"  substitutedInput(anti-HFP guard)=\(plan.substitutedInput)")
+
+        let aggregate = CallAudioAggregate()
+        do {
+            let id = try aggregate.create(plan: plan)
+            let subs = aggregate.subDeviceUIDs()
+            let master = aggregate.masterSubDeviceUID()
+            log("created aggregate deviceID=\(id); sub-devices=\(subs.count) "
+                + "[input present=\(subs.contains(plan.inputUID)), output present=\(subs.contains(plan.outputUID))]; "
+                + "master==input=\(master == plan.inputUID)")
+            let destroyStatus = aggregate.destroy()
+            // Device-list removal propagates through the HAL asynchronously; give it a moment,
+            // then confirm the aggregate is actually gone (no accumulation across runs).
+            Thread.sleep(forTimeInterval: 0.4)
+            let resolvedAfter = CoreAudioDevices.deviceID(forUID: CallAudioAggregate.aggregateUID)
+            log("destroyed (status=\(destroyStatus)); deviceID now \(aggregate.deviceID); "
+                + "resolvable by UID after settle=\(resolvedAfter != nil)")
+        } catch {
+            aggregate.destroy()
+            log("aggregate creation FAILED: \(error.localizedDescription)")
+        }
+    }
+
+    static func log(_ s: String) { FileHandle.standardError.write(Data("[selftest] \(s)\n".utf8)) }
+
+    /// Connects to the real, signed-in session read-only, runs `body` once it is ready, then
+    /// closes TDLib cleanly so the session database is flushed (never corrupted). Runs entirely
+    /// before `app.run()`, never opens a window or activates the app, and reuses the session —
+    /// never re-authenticates (see SESSION_PERSISTENCE_INVARIANT.md). `timeoutSeconds` bounds
+    /// the whole run so a stalled network can never hang the test or leave the DB lock held.
+    static func withReadySession(timeoutSeconds: TimeInterval, _ body: @escaping @MainActor (TDLibTelegramClient) async -> Void) {
         guard let configuration = TDLibConfiguration.resolve() else {
-            log("TDLib diagnostic: no usable credentials/session; nothing to test.")
+            log("no usable credentials/session; nothing to test.")
             return
         }
 
@@ -38,9 +198,7 @@ enum SelfTest {
             let client = TDLibTelegramClient(configuration: configuration)
 
             // Drain the update stream until the session is ready (or clearly can't proceed
-            // headlessly). Returns true only on `.ready`. updateNewMessage events are recorded
-            // inside the client regardless of who consumes the stream, so the Bug 2 tally is
-            // unaffected by stopping here.
+            // headlessly). Returns true only on `.ready`.
             let readiness = Task { @MainActor () -> Bool in
                 for await update in client.updates {
                     guard case .authorizationStateChanged(let state) = update else {
@@ -54,7 +212,7 @@ enum SelfTest {
                     case .closed:
                         return false
                     case .waitingForPhoneNumber, .waitingForCode, .waitingForPassword:
-                        log("session needs interactive sign-in; cannot run headless diagnostic.")
+                        log("session needs interactive sign-in; cannot run headless test.")
                         return false
                     default:
                         continue
@@ -67,7 +225,7 @@ enum SelfTest {
 
             // Wait for readiness, but never hang: if the network stalls, a bounded timeout must
             // still fall through to the clean shutdown below so the session database is flushed
-            // and its lock released. (A hung wait here previously could exit holding the lock.)
+            // and its lock released.
             let becameReady = await withTaskGroup(of: Bool.self) { group in
                 group.addTask { await readiness.value }
                 group.addTask { try? await Task.sleep(for: .seconds(30)); return false }
@@ -77,15 +235,9 @@ enum SelfTest {
             }
 
             if becameReady {
-                // Probe Bug 1 as cold as possible: a brief pause lets the chat list populate,
-                // but not long enough for background sync to warm per-chat history — which is
-                // exactly when the user hits the "only the latest message" bug. The Bug 2
-                // backfill flood streams in concurrently and is read at the end of the probe.
-                try? await Task.sleep(for: .milliseconds(120))
-                let report = await client.runMessageLoadingDiagnostic()
-                for line in report.components(separatedBy: "\n") { log(line) }
+                await body(client)
             } else {
-                log("session did not become ready within 30s; skipping probe and shutting down.")
+                log("session did not become ready within 30s; skipping and shutting down.")
             }
 
             // Stop this client, then block until TDLib has flushed and closed every client,
@@ -101,14 +253,35 @@ enum SelfTest {
         // Pump the main run loop so the @MainActor work above can execute (the main thread
         // is otherwise blocked here, before app.run()). Bounded so a hung network can't hang
         // the test forever.
-        let deadline = Date().addingTimeInterval(120)
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
         var completed = false
         while Date() < deadline {
             if done.wait(timeout: .now()) == .success { completed = true; break }
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
         }
-        if !completed { log("TDLib diagnostic timed out after \(Int(-start.timeIntervalSinceNow))s.") }
-        log("TDLib diagnostic finished in \(Int(-start.timeIntervalSinceNow))s.")
+        if !completed { log("self-test timed out after \(Int(-start.timeIntervalSinceNow))s.") }
+        log("self-test finished in \(Int(-start.timeIntervalSinceNow))s.")
+    }
+
+    /// Reports on the two message-loading bugs (chats showing only the latest message; the
+    /// initial-sync sound-effect flood).
+    static func runTDLibDiagnostic() {
+        withReadySession(timeoutSeconds: 120) { client in
+            // Probe Bug 1 as cold as possible: a brief pause lets the chat list populate, but
+            // not long enough for background sync to warm per-chat history.
+            try? await Task.sleep(for: .milliseconds(120))
+            let report = await client.runMessageLoadingDiagnostic()
+            for line in report.components(separatedBy: "\n") { log(line) }
+        }
+    }
+
+    /// Renders real message cells offscreen against the live session to verify message spacing,
+    /// real media (photo/sticker/video poster) rendering + caching, and scroll-back pagination.
+    static func runRenderTest() {
+        withReadySession(timeoutSeconds: 200) { client in
+            let report = await RenderSelfTest.run(client: client)
+            for line in report.components(separatedBy: "\n") { log(line) }
+        }
     }
 
     /// Lists the input devices the Preferences picker will show — pure property reads.

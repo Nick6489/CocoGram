@@ -48,6 +48,10 @@ final class SoundEffects {
             if let completion { Task { @MainActor in completion() } }
             return
         }
+        // Route to the user's chosen sound-effects output (a device UID), or nil for the
+        // system default. Set per-play so a Settings change takes effect on the next cue.
+        // Assigning the device doesn't open it; only play() does, immediately below.
+        player.currentDevice = AudioOutputPreference.uid(for: .soundEffects)
         player.currentTime = 0
         player.play()
 
