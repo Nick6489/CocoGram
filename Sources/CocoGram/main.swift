@@ -1485,7 +1485,9 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
                 removeDecodedVoiceMessage()
                 playingVoiceFileID = nil
                 updatePlaybackStatus("Voice playback failed")
-                announce("Couldn't play that voice message: \(error.localizedDescription)")
+                // Never surface the raw error (it can be a cryptic CoreAudio OSStatus, e.g. if the
+                // output device was unplugged mid-playback) — give a clean, actionable message.
+                announce("This voice message couldn’t be played. Check your audio output device, then try again.")
             }
         }
     }
@@ -1658,7 +1660,9 @@ final class DetailViewController: NSViewController, NSTableViewDataSource, NSTab
                 }.value
                 message = try await telegramClient.sendVoiceMessage(fileURL: encodedURL, duration: duration, chatID: chatID)
             } catch {
-                announce("Couldn't send that voice message: \(error.localizedDescription)")
+                // Don't leak the raw encoder/TDLib error (it can be a cryptic OSStatus or network
+                // code) — give a clean, actionable message.
+                announce("Couldn’t send that voice message. Check your connection and try again.")
                 return
             }
 
@@ -2455,12 +2459,20 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             // the cue isn't recorded.
             SoundEffects.shared.play(.startRecording) { [weak self] in
                 guard let self, !self.isClosing, self.state == .recordingPaused else { return }
+                // The recorder can be gone if a capture failure was detected (and finishRecording
+                // niled it) while paused. `recorder?.resume()` would then silently no-op via
+                // optional chaining and we'd falsely show "Recording" with no recorder — so confirm
+                // it's still alive and surface a failure otherwise.
+                guard let recorder = self.recorder else {
+                    self.presentRecordingFailure(VoiceMessageRecorder.RecorderError.configurationFailed("Recording stopped unexpectedly. Please try again."))
+                    return
+                }
                 do {
-                    try self.recorder?.resume()
+                    try recorder.resume()
                     self.updateState(.recording)
                     self.startTimer()
                 } catch {
-                    self.showRecordingError("Couldn't resume recording: \(error.localizedDescription)")
+                    self.presentRecordingFailure(error)
                 }
             }
         case .previewReady:
@@ -2480,7 +2492,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         // A write/device failure caught at Stop must be announced here — .previewReady is
         // silent and would enable Send on a corrupt take with no signal to VoiceOver.
         if let captureFailure {
-            showRecordingError("The recording couldn't be saved: \(captureFailure.localizedDescription)")
+            presentRecordingFailure(captureFailure)
             return
         }
         // Capture has stopped, so the Stop cue won't be recorded.
@@ -2493,7 +2505,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         finishRecording()
         previewPlayer?.stop()
         if let captureFailure {
-            showRecordingError("The recording couldn't be saved: \(captureFailure.localizedDescription)")
+            presentRecordingFailure(captureFailure)
             return
         }
         guard let recordingURL, recordedDuration > 0 else {
@@ -2590,7 +2602,7 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
         if state == .recording, let error = recorder?.captureError {
             timer?.invalidate()
             finishRecording()
-            showRecordingError("Recording stopped: \(error.localizedDescription)")
+            presentRecordingFailure(error)
             return
         }
         updateElapsedLabel()
@@ -2628,7 +2640,10 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
 
         guard !isClosing else { return }
         guard permissionGranted else {
-            showRecordingError("Microphone access is required to record a voice message.")
+            // Denied/restricted (or the user dismissed the prompt): the only fix is the Privacy
+            // pane, so guide there directly rather than failing silently.
+            showMicrophoneSettingsError("CocoGram needs microphone access to record voice messages. "
+                + "Open System Settings ▸ Privacy & Security ▸ Microphone and turn on CocoGram, then try again.")
             return
         }
 
@@ -2642,21 +2657,63 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             recordingURL = url
             self.recorder = recorder
 
-            // Play the Start cue first, then begin capture in its completion so the cue
-            // itself isn't recorded into the message.
+            // Play the Start cue first, then begin capture in its completion so the cue itself
+            // isn't recorded into the message. start() now confirms the mic actually opened, so a
+            // blocked microphone is reported here as an actionable error — never a raw OSStatus.
             SoundEffects.shared.play(.startRecording) { [weak self] in
                 guard let self, !self.isClosing, self.recorder === recorder else { return }
-                do {
-                    try recorder.start()
-                    self.updateState(.recording)
-                    self.startTimer()
-                    self.announce("Recording started")
-                } catch {
-                    self.showRecordingError("Couldn't start recording: \(error.localizedDescription)")
+                Task { @MainActor [weak self] in
+                    guard let self, !self.isClosing, self.recorder === recorder else { return }
+                    do {
+                        try await recorder.start()
+                        self.updateState(.recording)
+                        self.startTimer()
+                        self.announce("Recording started")
+                    } catch {
+                        self.presentRecordingFailure(error)
+                    }
                 }
             }
         } catch {
-            showRecordingError("Couldn't start recording: \(error.localizedDescription)")
+            presentRecordingFailure(error)
+        }
+    }
+
+    /// Single funnel for any recording failure: shows an actionable message (and, for a mic-access
+    /// block, the Microphone Settings recovery) and NEVER leaks a raw OSStatus to the user.
+    private func presentRecordingFailure(_ error: Error) {
+        recorder?.stop()
+        recorder = nil
+        if VoiceMessageRecorder.isMicrophoneAccessFailure(error) {
+            showMicrophoneSettingsError(VoiceMessageRecorder.RecorderError.microphoneAccessBlocked.errorDescription ?? "The microphone is unavailable.")
+        } else if let recorderError = error as? VoiceMessageRecorder.RecorderError {
+            showRecordingError(recorderError.errorDescription ?? "Recording failed. Please try again.")
+        } else {
+            // Unknown/unexpected error — give a clean message, not the underlying code.
+            showRecordingError("Recording failed. Please try again.")
+        }
+    }
+
+    /// Shows a microphone-access failure with a one-tap path to the Privacy ▸ Microphone settings.
+    private func showMicrophoneSettingsError(_ message: String) {
+        timer?.invalidate()
+        statusLabel.stringValue = message
+        statusLabel.setAccessibilityLabel(message)
+        playPauseButton.isEnabled = false
+        stopButton.isEnabled = false
+        sendButton.isEnabled = false
+        announce(message)
+        guard let window = view.window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Microphone Unavailable"
+        alert.informativeText = message
+        alert.addButton(withTitle: "Open Microphone Settings")
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn,
+                  let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+            else { return }
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -2675,7 +2732,10 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             updateState(.previewPlaying)
             startTimer()
         } catch {
-            showRecordingError("Couldn't play the recording preview: \(error.localizedDescription)")
+            // A preview-playback failure is an OUTPUT-device problem (e.g. headphones unplugged),
+            // not a mic block — so don't route to the Microphone recovery and never leak the raw
+            // OSStatus. The recording is intact and can still be sent.
+            showRecordingError("Couldn’t play the preview — check your audio output device. You can still send this recording.")
         }
     }
 

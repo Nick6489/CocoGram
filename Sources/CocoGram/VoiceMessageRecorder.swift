@@ -40,16 +40,63 @@ enum AudioInputPreference {
 final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     enum RecorderError: LocalizedError {
         case noInputDevice
+        case selectedDeviceUnavailable
+        /// The microphone exists but the OS won't let us open it — a permission/TCC or HAL block.
+        /// This is the case behind the cryptic "OSStatus error 2003334207" reports.
+        case microphoneAccessBlocked
+        /// The mic opened fine but writing/decoding the captured audio failed (disk full, file
+        /// permissions, a bad sample buffer). NOT a microphone-access issue — so it must never be
+        /// routed to the Microphone settings recovery, and it never carries a raw OSStatus.
+        case writeFailure
         case configurationFailed(String)
 
         var errorDescription: String? {
             switch self {
             case .noInputDevice:
-                return "No microphone is available to record from."
+                return "No microphone is available to record from. Connect or enable a microphone, then try again."
+            case .selectedDeviceUnavailable:
+                return "Your selected microphone isn’t available. Choose another in Settings (⌘,)."
+            case .microphoneAccessBlocked:
+                return "CocoGram couldn’t use the microphone. Open System Settings ▸ Privacy & Security ▸ "
+                    + "Microphone and make sure CocoGram is turned on. If it’s already on, switch it off and "
+                    + "back on, then try recording again."
+            case .writeFailure:
+                return "The recording couldn’t be saved. Make sure there’s free disk space, then try again."
             case .configurationFailed(let detail):
                 return detail
             }
         }
+
+        /// True when the right recovery is the System Settings ▸ Privacy ▸ Microphone pane.
+        var isMicrophoneAccessIssue: Bool {
+            if case .microphoneAccessBlocked = self { return true }
+            return false
+        }
+    }
+
+    /// Classifies any error from the capture pipeline as a microphone-access failure. The OS
+    /// reports a blocked/un-startable input HAL as a generic, cryptic OSStatus (e.g. 2003334207 =
+    /// 'wht?'), or as an AVFoundation capture error — all of which mean, for a recorder, "we
+    /// couldn't get the microphone." Used so the UI shows an actionable message, never the raw code.
+    static func isMicrophoneAccessFailure(_ error: Error) -> Bool {
+        if let recorderError = error as? RecorderError { return recorderError.isMicrophoneAccessIssue }
+        let nsError = error as NSError
+        let blockedCodes: Set<Int> = [
+            2003334207,                               // 'wht?' generic HAL/stream "unspecified"
+            Int(kAudioHardwareUnspecifiedError),      // 'what'
+            Int(kAudioHardwareNotRunningError),       // 'stop'
+            Int(kAudioHardwareIllegalOperationError), // 'nope'
+            Int(kAudioHardwareBadDeviceError),        // '!dev'
+            Int(kAudioDevicePermissionsError),        // '!hog'
+        ]
+        if blockedCodes.contains(nsError.code) { return true }
+        // An AVFoundation-domain error here can only have come from the capture pipeline
+        // (AVCaptureDeviceInput construction or AVCaptureSession.runtimeErrorNotification) — i.e.
+        // the input device itself failing, which for a recorder means "we couldn't get the mic."
+        // File/data write failures are wrapped as RecorderError.writeFailure and caught above by
+        // the `as? RecorderError` branch, so they never reach (and are never misclassified by) this.
+        if nsError.domain == AVFoundationErrorDomain { return true }
+        return false
     }
 
     let url: URL
@@ -78,7 +125,7 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
             // silently fall back to the system default (which could be the AirPods) — that
             // would record from a device the user didn't pick. Surface an error instead.
             guard let chosen = AVCaptureDevice(uniqueID: uid) else {
-                throw RecorderError.configurationFailed("Your selected microphone isn’t available. Choose another in Settings (⌘,).")
+                throw RecorderError.selectedDeviceUnavailable
             }
             device = chosen
         } else {
@@ -93,7 +140,9 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
         do {
             input = try AVCaptureDeviceInput(device: device)
         } catch {
-            throw RecorderError.configurationFailed("Couldn't open “\(device.localizedName)”: \(error.localizedDescription)")
+            // Never surface the raw OSStatus; map a blocked mic to the actionable message.
+            if Self.isMicrophoneAccessFailure(error) { throw RecorderError.microphoneAccessBlocked }
+            throw RecorderError.configurationFailed("Couldn’t open “\(device.localizedName)”. Choose another microphone in Settings (⌘,).")
         }
 
         session.beginConfiguration()
@@ -126,14 +175,34 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
         }
     }
 
-    func start() throws {
+    /// Starts capture and CONFIRMS the input actually came up before returning. `startRunning()`
+    /// never throws — a microphone blocked by TCC/permission or an un-startable HAL surfaces only
+    /// as `isRunning == false` and/or an async runtime-error notification (the cryptic
+    /// "OSStatus 2003334207" path). Confirming here lets the caller present an actionable error
+    /// immediately instead of leaking a raw OSStatus mid-recording.
+    func start() async throws {
         setPaused(false)
-        // startRunning() is blocking, so run it off the main thread. It opens ONLY the
-        // selected input device; being input-only, it can't disturb the output (AirPods).
-        sampleQueue.async { [weak self] in
-            guard let self, !self.session.isRunning else { return }
-            self.session.startRunning()
+        clearWriteError()
+        // startRunning() is blocking, so run it off the main thread. It opens ONLY the selected
+        // input device; being input-only, it can't disturb the output (AirPods).
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            sampleQueue.async { [weak self] in
+                if let self, !self.session.isRunning { self.session.startRunning() }
+                continuation.resume()
+            }
         }
+        // Give a runtime error (e.g. a TCC/HAL denial) a brief moment to post, then verify the
+        // session is genuinely running. Any failure here means we couldn't get the microphone.
+        try? await Task.sleep(for: .milliseconds(250))
+        // Read the captured error ONCE into a local. Don't re-clear it here: line 174 already gave
+        // this start() a clean slate, and a second clear would race the runtime-error observer
+        // (which fires on a background thread) — wiping a failure that posts in the gap, so start()
+        // would falsely report success and recording would silently produce nothing.
+        if let error = captureError {
+            throw Self.isMicrophoneAccessFailure(error) ? RecorderError.microphoneAccessBlocked
+                                                        : RecorderError.configurationFailed("Recording couldn’t start. Please try again.")
+        }
+        guard session.isRunning else { throw RecorderError.microphoneAccessBlocked }
     }
 
     /// Pause keeps the session running but stops writing, so `currentTime` freezes and the
@@ -158,6 +227,10 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
 
     private func setWriteErrorIfNil(_ error: Error) {
         lock.lock(); if writeError == nil { writeError = error }; lock.unlock()
+    }
+
+    private func clearWriteError() {
+        lock.lock(); writeError = nil; lock.unlock()
     }
 
     var currentTime: TimeInterval {
@@ -206,13 +279,18 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
                 sampleBuffer, at: 0, frameCount: Int32(frames), into: pcm.mutableAudioBufferList
             )
             guard status == noErr else {
-                writeError = RecorderError.configurationFailed("Couldn't read captured audio (\(status)).")
+                // Never bake the raw OSStatus into a user-facing string — surface a clean,
+                // actionable write failure instead (see RecorderError.writeFailure).
+                writeError = RecorderError.writeFailure
                 return
             }
             try outputFile?.write(from: pcm)
             writtenFrames += AVAudioFrameCount(frames)
         } catch {
-            writeError = error
+            // AVAudioFile create/write failures are disk/file problems, not a mic block. Wrap them
+            // as a clean writeFailure so the UI never shows a raw error and never misdirects the
+            // user to the Microphone settings.
+            writeError = RecorderError.writeFailure
         }
     }
 

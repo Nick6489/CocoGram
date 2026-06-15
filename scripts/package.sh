@@ -22,6 +22,9 @@ MIN_MACOS="${MIN_MACOS:-15.0}"
 
 # Developer ID Application identity (from `security find-identity -v -p codesigning`).
 SIGN_IDENTITY="${SIGN_IDENTITY:-Developer ID Application: D Ebert (NU5AXB7577)}"
+# The Developer ID TEAM the signature must belong to. Both build machines must use the SAME team
+# so a cross-machine update never resets an existing user's microphone (TCC) grant. Verified post-sign.
+EXPECTED_TEAM="${EXPECTED_TEAM:-NU5AXB7577}"
 
 # App Store Connect API key for notarization. Shared out-of-band; kept out of the repo.
 NOTARY_KEY="${NOTARY_KEY:-$HOME/Downloads/AuthKey_3449L7URA8.p8}"
@@ -147,6 +150,30 @@ say "Verifying microphone entitlement is present"
 codesign -d --entitlements - --xml "$APP" 2>/dev/null | grep -q "com.apple.security.device.audio-input" \
     && echo "  audio-input entitlement: OK" \
     || { echo "ERROR: audio-input entitlement missing from signed app" >&2; exit 1; }
+
+# ---- 5a. Microphone won't-break-again guarantees (BOTH build machines) --------------
+# Voice recording fails with a cryptic "OSStatus 2003334207" if EITHER the mic usage string is
+# missing (no TCC prompt) OR the signing TEAM differs between this build and the one the user
+# already has installed (TCC/Gatekeeper then treat the update as a different app and the prior
+# microphone grant no longer applies). This project is built on two workstations, so assert both
+# here — identically on each machine — so a misconfigured machine fails the build instead of
+# shipping an app that can't record for existing users.
+say "Verifying microphone usage string is in the bundle"
+/usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$CONTENTS/Info.plist" >/dev/null 2>&1 \
+    && echo "  NSMicrophoneUsageDescription: OK" \
+    || { echo "ERROR: NSMicrophoneUsageDescription missing from bundle Info.plist — TCC will never prompt for the mic" >&2; exit 1; }
+
+say "Verifying signing team is consistent (so existing users keep their mic permission)"
+SIGNED_TEAM="$(codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+if [ "$SIGNED_TEAM" != "$EXPECTED_TEAM" ]; then
+    echo "ERROR: signed with team '$SIGNED_TEAM' but expected '$EXPECTED_TEAM'." >&2
+    echo "       Both build machines MUST sign with the same Developer ID team, or an update will" >&2
+    echo "       reset every existing user's microphone permission (and Gatekeeper update trust)." >&2
+    echo "       Fix SIGN_IDENTITY/keychain on this machine, or override EXPECTED_TEAM if the team" >&2
+    echo "       genuinely changed (then expect existing users to re-grant the mic once)." >&2
+    exit 1
+fi
+echo "  signing team: $SIGNED_TEAM (matches expected)"
 
 # ---- 5b. Refresh LaunchServices so the freshly-built app shows its icon -------------
 # Re-register the bundle and bump its mtime so LaunchServices re-reads the just-signed icon
