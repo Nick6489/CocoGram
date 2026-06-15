@@ -108,9 +108,30 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
     private var outputFile: AVAudioFile?
     private var fileFormat: AVAudioFormat?
     private var writtenFrames: AVAudioFrameCount = 0
+    /// Raw count of sample buffers the HAL has actually delivered, incremented at the TOP of
+    /// captureOutput BEFORE the pause/write-error guard. This is the ONLY trustworthy proof the mic
+    /// is genuinely live: AVCaptureSession reports isRunning == true and fires no runtime error when
+    /// a stale/mismatched TCC grant silently starves the audio HAL (the cross-machine "authorized
+    /// but no frames" failure), so session state cannot be believed. Unlike writtenFrames, this is
+    /// NOT gated by isPaused/writeError — it measures HAL delivery, not successful writes.
+    private var deliveredBuffers: Int = 0
     private var writeError: Error?
     private var isPaused = false
     private var runtimeErrorObserver: NSObjectProtocol?
+
+    /// How long start() waits for the FIRST real audio buffer before declaring the mic dead. Sized
+    /// to cover slow consumer inputs (USB condensers ~0.8–1.2s, Bluetooth-as-input ~0.5–1.5s on cold
+    /// connect, virtual/aggregate ~1–1.8s) while a built-in mic warms in <0.15s — so it feels
+    /// instant on a healthy mic (start() returns the moment the first buffer lands) yet never hangs.
+    /// Overridable via COCOGRAM_BUFFER_TIMEOUT (seconds) to field-diagnose an unusually slow device
+    /// on another workstation without a recompile; clamped to [1.0, 6.0] so a typo can't disable the
+    /// gate or stall the UI. Do NOT lower the default below ~1.5s (slow Bluetooth false-positives).
+    static let firstBufferTimeout: TimeInterval = {
+        if let raw = ProcessInfo.processInfo.environment["COCOGRAM_BUFFER_TIMEOUT"], let v = Double(raw) {
+            return min(max(v, 1.0), 6.0)
+        }
+        return 2.0
+    }()
 
     /// Creates a recorder writing to `url`, bound to the device chosen in Preferences (or
     /// the system default when none is chosen). Looking up / configuring the device does
@@ -175,34 +196,61 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
         }
     }
 
-    /// Starts capture and CONFIRMS the input actually came up before returning. `startRunning()`
-    /// never throws — a microphone blocked by TCC/permission or an un-startable HAL surfaces only
-    /// as `isRunning == false` and/or an async runtime-error notification (the cryptic
-    /// "OSStatus 2003334207" path). Confirming here lets the caller present an actionable error
-    /// immediately instead of leaking a raw OSStatus mid-recording.
+    /// Starts capture and CONFIRMS the microphone is GENUINELY LIVE before returning — i.e. that the
+    /// HAL actually delivered a real audio buffer. `session.isRunning` is NOT sufficient and
+    /// `startRunning()` returning is NOT sufficient: on another workstation with a stale/mismatched
+    /// TCC grant, the session reports isRunning == true, fires NO runtime-error notification, and yet
+    /// the HAL never delivers a single buffer — the silent "dead recorder" (frozen clock, dimmed
+    /// Stop). Worse, `startRunning()` is blocking and can stall a long time on such a mic, so
+    /// AWAITING it is exactly what hung the recorder in `.preparing`.
+    ///
+    /// So we do two things differently: (1) fire `startRunning()` on a throwaway background queue and
+    /// DO NOT await it — the start path can never hang no matter how `startRunning()` behaves; and
+    /// (2) prove liveness purely by polling the HAL frame counter on a bounded timer. The only exits
+    /// are "a real buffer arrived" (success) or "the timeout elapsed / a runtime error posted"
+    /// (throw an actionable mic-access error). The dead-recorder state is structurally unreachable.
     func start() async throws {
         setPaused(false)
         clearWriteError()
-        // startRunning() is blocking, so run it off the main thread. It opens ONLY the selected
-        // input device; being input-only, it can't disturb the output (AirPods).
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            sampleQueue.async { [weak self] in
-                if let self, !self.session.isRunning { self.session.startRunning() }
-                continuation.resume()
-            }
+        resetDeliveredBuffers()
+        // Kick startRunning() off the main thread WITHOUT awaiting it, on a queue OTHER than
+        // sampleQueue so the capture delegate can still deliver buffers (proving liveness) even
+        // while a slow/blocked startRunning() is still working. It opens ONLY the selected input
+        // device; being input-only, it can't disturb the output (AirPods).
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            if !self.session.isRunning { self.session.startRunning() }
         }
-        // Give a runtime error (e.g. a TCC/HAL denial) a brief moment to post, then verify the
-        // session is genuinely running. Any failure here means we couldn't get the microphone.
-        try? await Task.sleep(for: .milliseconds(250))
-        // Read the captured error ONCE into a local. Don't re-clear it here: line 174 already gave
-        // this start() a clean slate, and a second clear would race the runtime-error observer
-        // (which fires on a background thread) — wiping a failure that posts in the gap, so start()
-        // would falsely report success and recording would silently produce nothing.
-        if let error = captureError {
-            throw Self.isMicrophoneAccessFailure(error) ? RecorderError.microphoneAccessBlocked
-                                                        : RecorderError.configurationFailed("Recording couldn’t start. Please try again.")
+        try await awaitFirstBufferOrThrow(timeout: Self.firstBufferTimeout)
+    }
+
+    /// The liveness gate, factored out so the headless self-test can prove it without opening a
+    /// device. Returns normally iff a real buffer arrived before the deadline; otherwise throws the
+    /// actionable mic-access error. Polls `deliveredBufferCount` (the only trustworthy "mic is live"
+    /// signal) and surfaces any runtime error (TCC/HAL denial) the instant it posts. Cannot hang: it
+    /// is bounded by `timeout`. `clearWriteError()` was called once by `start()` before this; the
+    /// gate only READS `captureError`, honoring the no-second-clear race rule below.
+    func awaitFirstBufferOrThrow(timeout: TimeInterval) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            // A runtime-error notification (the cryptic "OSStatus 2003334207" path) means the input
+            // failed outright — report immediately, don't wait out the full timeout.
+            if let error = captureError { throw Self.classify(error) }
+            if deliveredBufferCount > 0 { return }   // The mic is live: real audio is flowing.
+            try? await Task.sleep(for: .milliseconds(50))
         }
-        guard session.isRunning else { throw RecorderError.microphoneAccessBlocked }
+        // Timed out with zero buffers: the session may claim it's running, but no audio ever arrived.
+        // This is the cross-machine stale-TCC starvation (or a wedged HAL). If a late runtime error
+        // posted, classify it; otherwise treat the silence itself as a mic-access block so the
+        // existing recovery UI (Privacy ▸ Microphone, toggle off/on) is shown — never a dead clock.
+        if let error = captureError { throw Self.classify(error) }
+        throw RecorderError.microphoneAccessBlocked
+    }
+
+    /// Maps a capture-pipeline error to a user-facing RecorderError, never leaking a raw OSStatus.
+    private static func classify(_ error: Error) -> RecorderError {
+        isMicrophoneAccessFailure(error) ? .microphoneAccessBlocked
+                                         : .configurationFailed("Recording couldn’t start. Please try again.")
     }
 
     /// Pause keeps the session running but stops writing, so `currentTime` freezes and the
@@ -233,6 +281,10 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
         lock.lock(); writeError = nil; lock.unlock()
     }
 
+    private func resetDeliveredBuffers() {
+        lock.lock(); deliveredBuffers = 0; lock.unlock()
+    }
+
     var currentTime: TimeInterval {
         lock.lock(); defer { lock.unlock() }
         return Double(writtenFrames) / (fileFormat?.sampleRate ?? 48_000)
@@ -241,6 +293,13 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
     var captureError: Error? {
         lock.lock(); defer { lock.unlock() }
         return writeError
+    }
+
+    /// Number of audio buffers the HAL has actually delivered. Read by the liveness gate to confirm
+    /// the microphone truly came up; lock-guarded because captureOutput writes it on the sample queue.
+    var deliveredBufferCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return deliveredBuffers
     }
 
     // MARK: - Capture callback (private sample queue)
@@ -255,6 +314,11 @@ final class VoiceMessageRecorder: NSObject, AVCaptureAudioDataOutputSampleBuffer
 
         lock.lock()
         defer { lock.unlock() }
+        // Count raw HAL delivery FIRST, before the pause/write-error guard — this is what the
+        // liveness gate in start() polls. A paused recorder or a prior write failure must NOT hide
+        // the fact that the mic is genuinely delivering audio. Empty buffers were skipped above, so
+        // this counts only buffers carrying real samples: the correct "the mic is live" signal.
+        deliveredBuffers += 1
         guard !isPaused, writeError == nil else { return }
         do {
             if outputFile == nil {

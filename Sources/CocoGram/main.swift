@@ -2643,7 +2643,8 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
             // Denied/restricted (or the user dismissed the prompt): the only fix is the Privacy
             // pane, so guide there directly rather than failing silently.
             showMicrophoneSettingsError("CocoGram needs microphone access to record voice messages. "
-                + "Open System Settings ▸ Privacy & Security ▸ Microphone and turn on CocoGram, then try again.")
+                + "Open System Settings ▸ Privacy & Security ▸ Microphone and turn on CocoGram. "
+                + "If it’s already on, switch it off and back on, then try again.")
             return
         }
 
@@ -2664,6 +2665,13 @@ final class RecordingDialogController: NSViewController, AVAudioPlayerDelegate {
                 guard let self, !self.isClosing, self.recorder === recorder else { return }
                 Task { @MainActor [weak self] in
                     guard let self, !self.isClosing, self.recorder === recorder else { return }
+                    // start() now waits (briefly) for the first real audio buffer to confirm the mic
+                    // is genuinely live, so show an explicit "opening" status instead of a silent
+                    // gap. On success updateState(.recording) overwrites it immediately; on failure
+                    // presentRecordingFailure shows the actionable recovery. Either way we leave
+                    // .preparing — the dead "Preparing microphone" + dimmed Stop can't persist.
+                    self.statusLabel.stringValue = "Opening microphone…"
+                    self.statusLabel.setAccessibilityLabel("Opening microphone")
                     do {
                         try await recorder.start()
                         self.updateState(.recording)

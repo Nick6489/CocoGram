@@ -89,7 +89,13 @@ enum SelfTest {
             + "message leaks code: \(writeLeaks ? "FAIL ✗" : "no ✓"); avoids Mic misdirection: \(writeMisdirects ? "FAIL ✗" : "PASS ✓")")
         log("  → \"\(writeMsg)\"")
 
-        // 4) Happy path — ONLY if the mic is already authorized, so we never block on a prompt.
+        // 4) The cross-machine "running but ZERO frames" starvation (stale/mismatched TCC on a
+        //    second workstation): the liveness gate MUST detect a recorder that never receives a
+        //    buffer and throw a mic-access failure FAST — never return success into a dead clock.
+        //    Drives the gate directly with deliveredBufferCount == 0; opens NO device.
+        starvationDetected()
+
+        // 5) Happy path — ONLY if the mic is already authorized, so we never block on a prompt.
         let status = AVCaptureDevice.authorizationStatus(for: .audio)
         if status == .authorized {
             recordRoundTrip()
@@ -129,6 +135,45 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: caf)
         }
         let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            if done.wait(timeout: .now()) == .success { break }
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    /// Proves the liveness gate detects "session running but the HAL delivered ZERO buffers" (the
+    /// stale/mismatched-TCC cross-machine failure, and the startRunning()-hang case) as a mic-access
+    /// error within a short timeout — instead of returning success into a dead clock / dimmed Stop.
+    /// Opens NO device: it builds a recorder but drives `awaitFirstBufferOrThrow` directly with
+    /// deliveredBufferCount == 0 (no capture runs), then asserts it throws a mic-access error fast.
+    /// On a box with no input device the recorder can't be built and the check logs SKIPPED.
+    private static func starvationDetected() {
+        let done = DispatchSemaphore(value: 0)
+        let caf = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cocogram-starve-\(UUID().uuidString).caf")
+        Task.detached {
+            defer { done.signal() }
+            guard let recorder = try? VoiceMessageRecorder(url: caf) else {
+                log("  starvation: no input device to build a recorder — SKIPPED (gate mechanism unchanged)")
+                return
+            }
+            let started = Date()
+            do {
+                // Drive the gate directly with a short timeout; do NOT call start() (that opens the
+                // device). deliveredBufferCount is 0 because no capture is running → must throw.
+                try await recorder.awaitFirstBufferOrThrow(timeout: 0.4)
+                log("  starvation: gate returned SUCCESS with zero frames → FAIL ✗ (a dead recorder would ship)")
+            } catch {
+                let elapsed = Date().timeIntervalSince(started)
+                let isMic = VoiceMessageRecorder.isMicrophoneAccessFailure(error)
+                let msg = (error as? VoiceMessageRecorder.RecorderError)?.errorDescription ?? error.localizedDescription
+                let timely = elapsed < 1.0
+                log("  starvation: zero-frame gate threw in \(String(format: "%.2f", elapsed))s → "
+                    + "mic-access=\(isMic ? "PASS ✓" : "FAIL ✗"), timely=\(timely ? "PASS ✓" : "FAIL ✗"), no raw code=\(msg.contains("2003334207") ? "FAIL ✗" : "PASS ✓")")
+                log("  → \"\(msg)\"")
+            }
+            try? FileManager.default.removeItem(at: caf)
+        }
+        let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
             if done.wait(timeout: .now()) == .success { break }
             RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
